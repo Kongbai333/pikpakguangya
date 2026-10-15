@@ -1,0 +1,172 @@
+/**
+ * 管理端的组件级观感覆盖。
+ *
+ * 颜色 token 全部来自 style.css，这里不再重复定义 —— 以前两个文件各写一套
+ * :root，改一个颜色要同时改两处，很容易只改一半。
+ * 布局（侧边栏 / 顶栏 / 内容区）的样式在 App.vue 和 Sidebar.vue 的 scoped 里。
+ */
+body {
+  background: var(--app-bg);
+}
+
+/* ==========================================================================
+   表单控件对齐
+   ==========================================================================
+   Naive 的 Input / Select / Button / Tag 可见高度都走 --n-height，尺寸由 size
+   决定：large 40px、默认 34px、small 28px（Tag 比同档控件小一档）。
+   同一个工具栏里混用就会参差不齐（搜索框 40、旁边下拉框 34，差 6px 很显眼）。
+
+   注意 --n-height 是 Naive 通过行内 style 写到元素上的（cssVars 机制），
+   普通选择器压不住它，必须 !important —— 行内样式属于「普通作者声明」，
+   作者样式表里的 !important 优先级比它高。
+
+   给「同一行控件」的容器加 .ctl-row，整行统一按 --control-h 出高度，
+   模板里 size 写岔了也不会歪。需要另一档高度就在那个容器上覆盖
+   --control-h（前台大搜索框 40px、次级工具栏 28px）。 */
+.ctl-row .n-input,
+.ctl-row .n-input-number,
+.ctl-row .n-base-selection,
+.ctl-row .n-button,
+.ctl-row .n-tag {
+  --n-height: var(--control-h) !important;
+}
+
+/* ---------- 命令面板入口 ---------- */
+.cmd-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 8px 0 11px;
+  border: 1px solid var(--app-line);
+  border-radius: 999px;
+  background: var(--app-bg);
+  color: var(--app-muted);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background var(--dur-fast) ease, color var(--dur-fast) ease,
+    border-color var(--dur-fast) ease;
+}
+
+.cmd-trigger:hover {
+  color: var(--app-text);
+  background: var(--app-panel);
+  border-color: color-mix(in srgb, var(--app-muted) 30%, var(--app-line));
+}
+
+.cmd-trigger kbd {
+  padding: 1px 5px;
+  border: 1px solid var(--app-line);
+  border-radius: 5px;
+  background: var(--app-panel);
+  color: var(--app-faint);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 16px;
+}
+
+@media (max-width: 860px) {
+  .cmd-trigger span {
+    display: none;
+  }
+  .cmd-trigger {
+    padding: 0 10px;
+  }
+}
+
+/* ==========================================================================
+   卡片：给一层「浮起来」的质感。
+   以前是 border:0 + box-shadow:none，卡片和页面底色完全贴死，
+   整页看起来就是几块灰板子叠在一起。
+   ========================================================================== */
+.app-content .n-card {
+  border: 1px solid var(--app-line);
+  background: var(--app-panel);
+  box-shadow: var(--shadow-card);
+  transition:
+    border-color var(--dur-fast) ease,
+    box-shadow var(--dur) var(--ease-out);
+}
+
+.app-content .n-card:hover {
+  border-color: color-mix(in srgb, var(--app-muted) 20%, var(--app-line));
+  box-shadow: var(--shadow-2);
+}
+
+.app-content .n-card > .n-card-header {
+  padding-bottom: 12px;
+}
+
+/* ==========================================================================
+   表格
+   列宽、行高、配色走 App.vue 的 themeOverrides；这里只补结构上的东西。
+   ========================================================================== */
+.app-content .n-data-table {
+  background: transparent;
+}
+
+/* 吸顶表头：表格内部滚动时表头一直可见，加一条分隔线说明它「浮在上面」 */
+.app-content .n-data-table-thead {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+}
+
+.app-content .n-data-table-th {
+  border-bottom: 1px solid var(--app-line) !important;
+  font-size: 12.5px;
+  letter-spacing: 0.2px;
+}
+
+.app-content .n-data-table-th:not(:last-child)::after {
+  display: none;
+}
+
+.app-content .n-data-table-td {
+  border-bottom: 1px solid var(--app-line-soft) !important;
+}
+
+.app-content .n-data-table-tr:last-child .n-data-table-td {
+  border-bottom: 0 !important;
+}
+
+/* 单元格里的链接：悬停才出现下划线，静态时保持干净 */
+.app-content .n-data-table-td a {
+  text-decoration: none;
+  transition: color var(--dur-fast) ease;
+}
+
+.app-content .n-data-table-td a:hover {
+  text-decoration: underline;
+}
+
+.app-content .n-data-table__pagination {
+  border-top: 1px solid var(--app-line-soft);
+  padding: 12px 0 4px;
+}
+
+.app-content .n-data-table-empty {
+  padding: 48px 0;
+  color: var(--app-faint);
+}
+
+/* 表格外层的卡片：内容区不留内边距，表格自己铺满 */
+.app-content .n-card__content:has(> .n-data-table) {
+  padding: 0;
+}
+
+.app-content .n-button {
+  font-weight: 500;
+}
+
+.app-content .n-button--primary-type {
+  box-shadow: none;
+}
+
+/* ==========================================================================
+   空状态 / 加载
+   ========================================================================== */
+.app-content .n-spin-container {
+  transition: opacity var(--dur) ease;
+}

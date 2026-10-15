@@ -1,0 +1,23 @@
+# 统一按 LF 存进仓库。
+#
+# Windows 上如果开了 core.autocrlf，检出时会变 CRLF：
+# docker/entrypoint.sh 带 CRLF 进镜像后 shebang 会失效（/bin/sh^M 找不到），
+# Dockerfile 也会在续行处报错。Linux 的 CI 是 LF，本地是 CRLF 的话
+# 「本地能跑、CI 挂掉」这类问题会反复出现。
+* text=auto eol=lf
+
+# Windows 脚本保持 CRLF，双击运行和记事本打开都正常
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制：不要做换行转换，也不要在 diff 里显示
+*.db binary
+*.session binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary

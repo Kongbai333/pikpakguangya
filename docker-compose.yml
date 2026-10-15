@@ -1,0 +1,21 @@
+# 直接用现成镜像：
+#   docker compose up -d
+#
+# 想自己构建就把 image 那行注释掉、打开 build 那行。
+services:
+  pikpak:
+    image: ghcr.io/kongbai333/pikpakguangya:latest
+    # build: .
+    container_name: pikpak-collector
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # config.toml / pikpak.db / session / 日志 / 缩略图都在这里。
+      # 用 bind mount 而不是命名卷：第一次启动后会生成 data/config.toml，
+      # 直接编辑那个文件比 docker exec 进去改方便。
+      - ./data:/data
+    environment:
+      # 容器内的本机时区。config.toml 里 [app] timezone 留空时就用它。
+      # 改成你自己的时区，例如 Europe/London、America/New_York。
+      - TZ=Asia/Shanghai

@@ -1,0 +1,67 @@
+# 复制成 config.toml 后填写。config.toml 已在 .gitignore 里。
+# 注意：config.toml 含账号凭据，不要放进 OneDrive / 云同步目录。
+
+[telegram]
+# 在 https://my.telegram.org -> API development tools 申请
+api_id = 0
+api_hash = ""
+phone = "+8613800000000"
+# 登录态文件路径（含账号 auth key，等同于密码，务必别外传）
+session = "session/collector"
+
+[collector]
+# 要监听的群：支持 @username、t.me 链接、或数字 id（-100xxxxxxxxxx）
+watch = [
+  # "@some_group",
+]
+# 离线补齐消息时的分页大小；0 = 不补历史，只收启动之后的新消息
+# 第一次监控某个群时不读历史，直接从当前最新开始
+backfill_limit = 200
+# 链接与提取码分两条消息发出时的合并窗口（秒）
+merge_window_seconds = 90
+# 非空时，消息必须命中其中任一关键词才入库（大小写不敏感）
+keywords_include = []
+# 命中任一关键词则丢弃
+keywords_exclude = []
+# 忽略这些发送者（@username 或数字 id，字符串比较）
+ignore_senders = []
+
+[storage]
+db = "pikpak.db"
+
+[checker]
+enabled = true
+# 后台定时校验的间隔（分钟）
+interval_minutes = 60
+# 同一链接超过这个小时数后重新校验
+recheck_after_hours = 24
+# 单批校验条数
+batch_size = 100
+# 并发别开大：PikPak 有风控，请求过密会直接断 TLS 连接
+concurrency = 2
+min_delay_seconds = 1.5
+timeout_seconds = 25
+# 连续失败这么多次就中止本批（被限流时保护账号和 IP）
+max_consecutive_errors = 5
+# 上次是 ERROR 的链接多久后重试
+error_retry_minutes = 30
+
+[api]
+host = "127.0.0.1"
+port = 8000
+# 单次 /api/items 最多返回多少条（不传 limit 时返回分页结果）
+max_items = 50000
+
+[admin]
+# 管理后台登录密码。留空时后台接口默认拒绝访问。
+password = ""
+# 登录态有效期（小时）
+session_hours = 24
+
+[app]
+# 展示用时区。数据库里存的一律是 UTC，这里只影响「按天 / 按分钟」分桶的
+# 统计和页面标签 —— 不配的话 UTC+8 的用户在早上 8 点前看到的「今天」是昨天。
+# 留空 = 跟随本机时区。
+# Windows 上填 IANA 名字（Asia/Shanghai）需要装 tzdata：
+#   .\.venv\Scripts\python.exe -m pip install tzdata
+timezone = ""

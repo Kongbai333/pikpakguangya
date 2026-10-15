@@ -1,0 +1,16 @@
+# 运行
+telethon>=1.36          # Telegram 用户账号客户端（Bot 读不到群消息，必须用用户账号）
+python-socks[asyncio]>=2.4   # Telethon 用代理时必需：缺了它 proxy 参数会被静默忽略
+httpx[socks]>=0.27      # 校验器抓分享页；[socks] 让它能走 socks5 代理
+fastapi>=0.115
+uvicorn[standard]>=0.32
+
+# 可选：Windows 上解析 [app] timezone 的 IANA 名字（Asia/Shanghai）需要它。
+# 不装的话会退回本机时区并在日志里告警，不影响运行。
+tzdata>=2024.1
+
+# 测试
+pytest>=8.3
+
+# 可选：加速 MTProto 加解密，缺失时 Telethon 自动回退纯 Python 实现
+# cryptg

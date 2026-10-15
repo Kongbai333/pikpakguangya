@@ -1,0 +1,439 @@
+@import 'tailwindcss';
+
+/* ==========================================================================
+   设计 token —— 全站唯一来源。
+   workbuddy-theme.css 只覆盖管理端外壳的观感，不再重复定义这些变量。
+
+   色彩策略：外壳保持中性（zinc 灰阶），只用一个强调色标记「可交互」。
+   以前 --app-brand 就是近黑色，于是链接、图标、正文全是一个颜色，
+   页面上看不出哪里能点。
+   ========================================================================== */
+:root {
+  --app-bg: #ffffff;
+  --app-panel: #f6f6f7;
+  --app-panel-2: #ececee;
+  --app-line: #e4e4e7;
+  --app-line-soft: #ededf0;
+  --app-text: #18181b;
+  --app-muted: #71717a;
+  --app-faint: #a1a1aa;
+
+  /* 强调色：链接、可点图标、聚焦环、选中态 */
+  --app-brand: #2563eb;
+  --app-brand-hover: #1d4ed8;
+  --app-brand-soft: #eaf1ff;
+  --app-brand-ring: rgba(37, 99, 235, 0.35);
+
+  --app-ok: #10b981;
+  --app-warn: #f59e0b;
+  --app-danger: #ef4444;
+
+  --shadow-1: 0 1px 2px rgba(24, 24, 27, 0.04);
+  --shadow-2: 0 2px 4px rgba(24, 24, 27, 0.05), 0 12px 28px -12px rgba(24, 24, 27, 0.16);
+  --shadow-3: 0 24px 70px rgba(24, 24, 27, 0.12);
+  /* 卡片静止时的极轻投影：有它才有「浮在页面上」的层次，而不是贴死的色块 */
+  --shadow-card: 0 1px 2px rgba(24, 24, 27, 0.04), 0 1px 1px rgba(24, 24, 27, 0.03);
+
+  --radius-sm: 8px;
+  --radius: 12px;
+  --radius-lg: 16px;
+
+  /* 动效：统一曲线和时长，prefers-reduced-motion 在文件末尾一次性关掉 */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-fast: 0.15s;
+  --dur: 0.22s;
+
+  /* 顶栏是**确定高度**（不是 min-height）：下面的吸顶元素全靠它算位置，
+     高度一变它们就会被盖住一半。 */
+  --top-h: 64px;
+  --side-w: 236px;
+  --side-w-mini: 68px;
+
+  /* 内容区最大宽度，表格和卡片共用一套栅格 */
+  --page-max: 1560px;
+
+  /* 同一行里表单控件的统一高度。混用 Naive 的 size 会让输入框和下拉框
+     差 6px（large 40 / 默认 34 / small 28），看着就是没对齐。 */
+  --control-h: 34px;
+}
+
+html[data-theme='dark'] {
+  --app-bg: #111113;
+  --app-panel: #1d1d20;
+  --app-panel-2: #29292d;
+  --app-line: #303034;
+  --app-line-soft: #28282c;
+  --app-text: #f4f4f5;
+  --app-muted: #a1a1aa;
+  --app-faint: #71717a;
+
+  --app-brand: #60a5fa;
+  --app-brand-hover: #93c5fd;
+  --app-brand-soft: rgba(96, 165, 250, 0.14);
+  --app-brand-ring: rgba(96, 165, 250, 0.4);
+
+  --app-ok: #34d399;
+  --app-warn: #fbbf24;
+  --app-danger: #f87171;
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.28);
+  --shadow-2: 0 2px 6px rgba(0, 0, 0, 0.34), 0 14px 32px -14px rgba(0, 0, 0, 0.6);
+  --shadow-3: 0 24px 70px rgba(0, 0, 0, 0.5);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--app-bg);
+  color: var(--app-text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', 'Hiragino Sans GB', sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 键盘用户才看得到聚焦环；鼠标点击不显示，避免到处都是蓝框 */
+:focus-visible {
+  outline: 2px solid var(--app-brand);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+::selection {
+  background: var(--app-brand-soft);
+  color: var(--app-text);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--app-faint) 55%, transparent);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--app-muted) 70%, transparent);
+  background-clip: content-box;
+}
+
+/* ==========================================================================
+   通用小件
+   ========================================================================== */
+.muted {
+  color: var(--app-muted);
+}
+
+.faint {
+  color: var(--app-faint);
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace;
+  font-size: 13px;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+.brand-mark {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, #2563eb, #38bdf8);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+
+.icon-btn {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--app-line);
+  border-radius: 999px;
+  background: var(--app-bg);
+  color: var(--app-muted);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) ease,
+    color var(--dur-fast) ease,
+    border-color var(--dur-fast) ease,
+    transform var(--dur-fast) ease;
+}
+
+.icon-btn:hover {
+  color: var(--app-text);
+  background: var(--app-panel);
+  border-color: color-mix(in srgb, var(--app-muted) 35%, var(--app-line));
+}
+
+.icon-btn:active {
+  transform: scale(0.94);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 11px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--app-panel);
+  color: var(--app-muted);
+  font-size: 13px;
+  text-decoration: none;
+  white-space: nowrap;
+  transition:
+    background var(--dur-fast) ease,
+    color var(--dur-fast) ease,
+    border-color var(--dur-fast) ease;
+}
+
+.chip:hover {
+  color: var(--app-text);
+  background: var(--app-panel-2);
+}
+
+.chip .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  /* 状态点带一圈光晕，小圆点才有存在感 */
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 18%, transparent);
+}
+
+.offline-bar {
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  border: 1px solid color-mix(in srgb, var(--app-danger) 32%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--app-danger) 9%, var(--app-bg));
+  color: var(--app-danger);
+  font-size: 13px;
+}
+
+/* ==========================================================================
+   骨架屏：首屏加载时先占位，比一片空白或单个转圈稳
+   ========================================================================== */
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--app-panel-2);
+}
+
+.skeleton::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--app-bg) 65%, transparent),
+    transparent
+  );
+  animation: skeleton-sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes skeleton-sweep {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* ==========================================================================
+   页面切换
+   ========================================================================== */
+.page-enter {
+  animation: page-in var(--dur) var(--ease-out);
+}
+
+@keyframes page-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ==========================================================================
+   数据展示小件
+   ========================================================================== */
+.kpi {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 18px 19px;
+  min-height: 112px;
+  background: var(--app-panel);
+  border: 1px solid transparent;
+  border-radius: var(--radius-lg);
+  transition:
+    transform var(--dur) var(--ease-spring),
+    box-shadow var(--dur) var(--ease-out),
+    background var(--dur-fast) ease;
+}
+
+/* 指标卡轻微抬起：一屏六张卡，有反馈才知道鼠标停在哪张 */
+.kpi:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-2);
+}
+
+.kpi .k {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--app-muted);
+}
+
+.kpi .n {
+  margin-top: 4px;
+  font-size: 32px;
+  font-weight: 650;
+  line-height: 1.1;
+  letter-spacing: -0.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.kpi .d {
+  font-size: 12.5px;
+  color: var(--app-faint);
+}
+
+/* 图标是「这张卡在看什么」的锚点，给强调色，别和正文一个灰 */
+.kpi .ico {
+  order: 2;
+  margin-left: auto;
+  display: grid;
+  place-items: center;
+  color: var(--app-brand);
+}
+
+.rank-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--app-line-soft);
+}
+
+.rank-row:last-child {
+  border-bottom: none;
+}
+
+.rank-row .no {
+  width: 18px;
+  text-align: right;
+  color: var(--app-faint);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rank-row .name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rank-row .val {
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 13px;
+  border-radius: 6px;
+  transition: background var(--dur-fast) ease;
+}
+
+.legend-row:hover {
+  background: var(--app-panel-2);
+}
+
+.legend-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.legend-name {
+  flex: 1;
+  min-width: 0;
+  color: var(--app-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.legend-val {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.legend-pct {
+  flex: 0 0 auto;
+  width: 46px;
+  text-align: right;
+  font-size: 12.5px;
+  color: var(--app-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+   窄屏
+   ========================================================================== */
+@media (max-width: 900px) {
+  .content {
+    padding: 14px 12px 24px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

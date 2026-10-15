@@ -1,0 +1,58 @@
+# 容器里用的配置模板。首次启动时 entrypoint.sh 会把它复制到
+# /data/config.toml —— 之后改的是 /data 里那份，不是这个文件。
+#
+# 和 config.example.toml 的区别只有两处：
+#   1. 路径都是 /data 下的绝对路径（数据卷）
+#   2. api.host 是 0.0.0.0（容器里监听 127.0.0.1 端口映射不出去）
+
+[telegram]
+# 在 https://my.telegram.org -> API development tools 申请
+api_id = 0
+api_hash = ""
+phone = "+8613800000000"
+# 登录态文件含账号 auth key，等同于密码；放数据卷里，别提交到仓库
+session = "/data/session/collector"
+
+[collector]
+# 要监听的群：支持 @username、t.me 链接、或数字 id（-100xxxxxxxxxx）
+watch = [
+  # "@some_group",
+]
+# 离线补齐消息时的分页大小；0 = 不补历史，只收启动之后的新消息
+backfill_limit = 200
+# 链接与提取码分两条消息发出时的合并窗口（秒）
+merge_window_seconds = 90
+keywords_include = []
+keywords_exclude = []
+ignore_senders = []
+
+[storage]
+db = "/data/pikpak.db"
+
+[checker]
+enabled = true
+interval_minutes = 60
+recheck_after_hours = 24
+batch_size = 100
+# 并发别开大：PikPak 有风控，请求过密会直接断 TLS 连接
+concurrency = 2
+min_delay_seconds = 1.5
+timeout_seconds = 25
+max_consecutive_errors = 5
+error_retry_minutes = 30
+
+[api]
+host = "0.0.0.0"
+port = 8000
+max_items = 50000
+
+[admin]
+# 管理后台登录密码。留空时后台接口一律拒绝访问 —— 部署到公网前**必须**填。
+password = ""
+session_hours = 24
+
+[app]
+# 展示用时区。库里存的一律是 UTC，这里只影响「按天 / 按分钟」分桶的统计和页面标签。
+# 留空 = 跟随本机时区，容器里就是 TZ 环境变量（docker-compose.yml 里设的那个）。
+# 也可以直接写死，例如 timezone = "Asia/Shanghai"。
+timezone = ""

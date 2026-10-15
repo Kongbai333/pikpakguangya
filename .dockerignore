@@ -1,0 +1,43 @@
+# 构建镜像时不要发给 docker daemon 的东西。
+# 传了会白白撑大构建上下文，还可能把凭据打进镜像层。
+
+.git
+.github
+.gitignore
+
+# 凭据与运行时数据：绝不能进镜像
+# 只排除项目根目录那份真实配置；docker/config.toml 是 Dockerfile 要 COPY 的
+# 空模板，少了它镜像直接构建失败（`failed to compute cache key: not found`）。
+/config.toml
+session/
+*.session
+*.session-journal
+*.db
+*.db-wal
+*.db-shm
+logs/
+media/
+# docker compose 挂出来的数据卷
+data/
+.pytest-tmp/
+.pytest_cache/
+
+# 导出快照（含真实链接）
+data.js
+shuju.json
+
+# 本机虚拟环境 / 前端依赖：镜像里各自重装
+.venv/
+web/node_modules/
+# web/dist 由镜像里的前端构建阶段生成，不用本机产物
+web/dist/
+
+# 杂项
+__pycache__/
+*.pyc
+.server.pid
+.ccgui/
+.multica/
+.agent_context/
+# 文档不进镜像（README 在仓库里看就行）
+*.md

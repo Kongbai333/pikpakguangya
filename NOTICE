@@ -1,0 +1,26 @@
+Telegram 群组 PikPak 分享链接采集
+Copyright 2026 Kongbai333
+
+This product includes software developed as part of the
+Telegram 群组 PikPak 分享链接采集 project.
+
+------------------------------------------------------------------------
+第三方组件（均为运行时依赖，未修改其源码）：
+
+Python
+  FastAPI / Starlette / Uvicorn   MIT / BSD-3-Clause
+  Telethon                        MIT
+  httpx                           BSD-3-Clause
+  Pydantic                        MIT
+  python-socks                    Apache-2.0
+  tzdata                          Apache-2.0
+
+前端
+  Vue 3                           MIT
+  Naive UI                        MIT
+  ECharts                         Apache-2.0
+  Tailwind CSS                    MIT
+  Vite                            MIT
+  lucide                          ISC
+
+完整清单见 requirements.txt 与 web/package.json。
