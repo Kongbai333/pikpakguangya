@@ -4,6 +4,9 @@
 # 想自己构建就把 image 那行注释掉、打开 build 那行。
 services:
   pikpak:
+    # ghcr.io/ 前缀不能省：写成 kongbai333/pikpakguangya 的话 Docker 会当成
+    # Docker Hub 的镜像去 registry-1.docker.io 找，那边没有，只会等到超时。
+    # 拉不动就换加速站（见 README「拉不动镜像怎么办」）。
     image: ghcr.io/kongbai333/pikpakguangya:latest
     # build: .
     container_name: pikpak-collector

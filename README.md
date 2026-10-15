@@ -28,6 +28,11 @@ docker run -d --name pikpak-collector \
   ghcr.io/kongbai333/pikpakguangya:latest
 ```
 
+> 镜像放在 GitHub 的容器仓库（GHCR）上，**名字里的 `ghcr.io/` 不能省**。写成
+> `kongbai333/pikpakguangya:latest` 的话，Docker 会当成 Docker Hub 的镜像去
+> `registry-1.docker.io` 找 —— 那边没有这个镜像，只能等到超时。
+> 国内网络拉不动 ghcr.io 的话，见下面的「拉不动镜像怎么办」。
+
 或者用 compose（仓库里带了 `docker-compose.yml`）：
 
 ```bash
@@ -43,6 +48,49 @@ docker compose up -d
 
 数据全在挂载出来的 `data/` 目录里（配置、SQLite 库、Telegram 登录态、日志、缩略图），
 删容器重建不会丢。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+
+### 拉不动镜像怎么办
+
+`ghcr.io` 在国内经常拉不动（`context deadline exceeded`、进度条卡住不动）。镜像压缩后
+只有 60 MB 左右，卡住基本都是链路问题，不是镜像大。三条路，按省事程度排：
+
+1. **换加速站拉，再改成官方名字**。改完名一定要打 tag，否则 compose / 面板会当成
+   另一个镜像，又跑去 ghcr.io 拉一遍：
+
+   ```bash
+   docker pull ghcr.nju.edu.cn/kongbai333/pikpakguangya:latest
+   docker tag  ghcr.nju.edu.cn/kongbai333/pikpakguangya:latest \
+               ghcr.io/kongbai333/pikpakguangya:latest
+   ```
+
+   备用站：`ghcr.dockerproxy.net`（前缀换成它，命令一样）。注意 `ghcr.m.daocloud.io`
+   现在会拒绝不在白名单里的镜像。
+
+2. **给 Docker 守护进程配代理**（服务器上有代理的话，一劳永逸）：
+
+   ```bash
+   sudo mkdir -p /etc/systemd/system/docker.service.d
+   sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf >/dev/null <<'EOF'
+   [Service]
+   Environment="HTTP_PROXY=http://代理地址:端口"
+   Environment="HTTPS_PROXY=http://代理地址:端口"
+   Environment="NO_PROXY=localhost,127.0.0.1"
+   EOF
+   sudo systemctl daemon-reload && sudo systemctl restart docker
+   ```
+
+   顺带一提：`/etc/docker/daemon.json` 里的 `registry-mirrors` **只对 Docker Hub
+   （docker.io）生效**，配了它也不会加速 ghcr.io。
+
+3. **从能连的机器搬过去**：
+
+   ```bash
+   docker pull ghcr.io/kongbai333/pikpakguangya:latest
+   docker save ghcr.io/kongbai333/pikpakguangya:latest | gzip > pikpak.tar.gz
+   scp pikpak.tar.gz 用户@服务器:/tmp/
+   # 服务器上
+   gunzip -c /tmp/pikpak.tar.gz | docker load
+   ```
 
 ### 从源码跑（Windows）
 
