@@ -26,6 +26,10 @@ data/
 data.js
 shuju.json
 
+# 备份归档：含 config.toml 和 Telegram 登录态，不能打进镜像层
+backups/
+*.tar.gz
+
 # 本机虚拟环境 / 前端依赖：镜像里各自重装
 .venv/
 web/node_modules/

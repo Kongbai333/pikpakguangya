@@ -5,9 +5,11 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useMessage } from 'naive-ui'
 import {
+  Archive,
   ArrowLeft,
   Bot,
   Cloud,
+  Download,
   FileText,
   Folder,
   FolderOpen,
@@ -21,6 +23,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Trash2,
+  Upload,
 } from 'lucide-vue-next'
 
 import * as api from '../api'
@@ -58,6 +61,16 @@ const logs = reactive({
   loading: false,
   cleaning: false,
 })
+const backup = reactive({
+  info: null,
+  file: null,
+  loading: false,
+  downloading: false,
+  restoring: false,
+  error: '',
+  result: null,
+})
+const backupInput = ref(null)
 const pikpakForm = reactive({ username: '', password: '' })
 const guangyaForm = reactive({ phone: '', code: '' })
 const guangyaToken = ref('')
@@ -227,6 +240,94 @@ async function cleanupLogs(clearCurrent = false) {
 
 let storageTimer = null
 let storageTries = 0
+
+async function loadBackup() {
+  backup.loading = true
+  try {
+    backup.info = await api.get('/api/backup')
+  } catch (e) {
+    backup.error = e.message
+  } finally {
+    backup.loading = false
+  }
+}
+
+/**
+ * 走 fetch 而不是 <a href>：需要从 Content-Disposition 里拿服务端生成的文件名，
+ * 而且接口失败时要能弹错误 —— 直接跳转会变成下载一个 JSON 报错页。
+ */
+async function downloadBackup() {
+  if (backup.downloading) return
+  backup.downloading = true
+  backup.error = ''
+  try {
+    const res = await fetch('/api/backup/download')
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`
+      try {
+        detail = (await res.json()).detail || detail
+      } catch {
+        /* 不是 JSON 就用状态码 */
+      }
+      throw new Error(detail)
+    }
+    const blob = await res.blob()
+    const matched = /filename="?([^";]+)"?/i.exec(
+      res.headers.get('content-disposition') || ''
+    )
+    const name = matched ? matched[1] : 'pikpak-backup.tar.gz'
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = name
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    message.success(`已生成备份 ${name}`)
+  } catch (e) {
+    backup.error = e.message
+    message.error(`生成备份失败：${e.message}`)
+  } finally {
+    backup.downloading = false
+  }
+}
+
+function pickBackupFile() {
+  backupInput.value?.click()
+}
+
+function onBackupPicked(event) {
+  backup.file = event.target.files?.[0] || null
+  backup.result = null
+  backup.error = ''
+  // 清掉 value，同一个文件再选一次也能触发 change
+  event.target.value = ''
+}
+
+async function restoreBackup() {
+  if (!backup.file || backup.restoring) return
+  backup.restoring = true
+  backup.error = ''
+  try {
+    // 直接把 File 当请求体发，后端收原始流；不用 multipart 就不用多装依赖
+    const res = await fetch(
+      `/api/backup/restore?name=${encodeURIComponent(backup.file.name)}`,
+      { method: 'POST', body: backup.file }
+    )
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+    backup.result = data
+    backup.file = null
+    message.success('还原完成')
+    await loadBackup()
+  } catch (e) {
+    backup.error = e.message
+    message.error(`还原失败：${e.message}`)
+  } finally {
+    backup.restoring = false
+  }
+}
 
 /** 缓存第一次是空的：等后台刷新完再补一两次，避免页面转圈等网盘。 */
 function scheduleStorageRetry(data) {
@@ -432,6 +533,7 @@ async function saveFolder() {
 onMounted(async () => {
   await Promise.all([
     load(), loadPk(), loadPub(), loadIntegrations(), loadTransferSettings(), loadLogs(),
+    loadBackup(),
   ])
 })
 /* ---------- 分区导航 ----------
@@ -447,6 +549,7 @@ const SECTIONS = [
   { id: 'set-proxy', label: '代理池', icon: Server },
   { id: 'set-share-api', label: '分享详情接口', icon: Sparkles },
   { id: 'set-public', label: '前台浏览页', icon: Globe },
+  { id: 'set-backup', label: '备份与还原', icon: Archive },
   { id: 'set-env', label: '环境信息', icon: Info },
   { id: 'set-logs', label: '日志', icon: FileText },
 ]
@@ -995,6 +1098,99 @@ onUnmounted(() => {
         </a>
         <span v-else class="text-[13.5px] muted">外部访问会看到「浏览页已关闭」</span>
       </div>
+    </n-card>
+
+    <!-- 备份与还原 -->
+    <n-card id="set-backup" size="small">
+      <template #header>
+        <div class="flex items-center gap-2">
+          <Archive :size="16" class="text-[var(--app-brand)]" />
+          <span class="font-semibold">备份与还原</span>
+          <n-tag v-if="backup.info" class="ml-2" size="small" round>
+            {{ backup.info.items.length }} 项 · {{ fmtBytes(backup.info.total_bytes) }}
+          </n-tag>
+        </div>
+      </template>
+
+      <p class="text-[13.5px] muted mt-0 mb-3">
+        换机器部署时不用重新配一遍：归档里装着配置、数据库、Telegram 登录态、缩略图和导出的静态快照，
+        <b>只有日志不装</b>。在新服务器上还原这个归档，等于把整套配置和数据搬过去。
+      </p>
+
+      <div v-if="backup.info" class="text-[12.5px] muted mb-3">
+        数据目录：<span class="mono">{{ backup.info.data_dir }}</span>
+      </div>
+
+      <div
+        v-if="backup.info?.items?.length"
+        class="mb-3 max-h-[190px] overflow-auto rounded-lg border border-[var(--app-line)]"
+      >
+        <div
+          v-for="item in backup.info.items"
+          :key="item.name"
+          class="flex items-center gap-3 px-3 py-2 text-[12.5px] border-b border-[var(--app-line)] last:border-b-0"
+        >
+          <span class="min-w-0 flex-1 truncate mono">{{ item.name }}</span>
+          <span class="shrink-0 muted">
+            {{ item.kind === 'dir' ? `${item.files} 个文件` : '' }}
+          </span>
+          <span class="shrink-0">{{ fmtBytes(item.bytes) }}</span>
+        </div>
+      </div>
+      <n-alert v-else-if="backup.info" class="mb-3" type="warning" :show-icon="true">
+        没有可备份的数据（配置、数据库、登录态都不存在）
+      </n-alert>
+
+      <div class="flex flex-wrap items-center gap-3">
+        <n-button
+          type="primary"
+          size="small"
+          :loading="backup.downloading"
+          @click="downloadBackup"
+        >
+          <template #icon><Download :size="14" /></template>
+          下载备份
+        </n-button>
+
+        <input
+          ref="backupInput"
+          type="file"
+          accept=".gz,.tgz,.tar.gz,application/gzip"
+          class="hidden"
+          @change="onBackupPicked"
+        />
+        <n-button size="small" secondary @click="pickBackupFile">
+          <template #icon><Upload :size="14" /></template>
+          选择归档
+        </n-button>
+
+        <n-popconfirm v-if="backup.file" @positive-click="restoreBackup">
+          <template #trigger>
+            <n-button size="small" type="warning" :loading="backup.restoring">
+              还原
+            </n-button>
+          </template>
+          用「{{ backup.file.name }}」覆盖当前配置和数据？日志不动。还原完要重启服务。
+        </n-popconfirm>
+        <span v-if="backup.file" class="max-w-[280px] truncate text-[12.5px] muted">
+          {{ backup.file.name }}
+        </span>
+      </div>
+
+      <n-alert v-if="backup.error" class="mt-3" type="error" :show-icon="true">
+        {{ backup.error }}
+      </n-alert>
+
+      <n-alert v-if="backup.result" class="mt-3" type="success" :show-icon="true">
+        已还原 {{ backup.result.files }} 个文件（{{ backup.result.applied.join('、') }}）。
+        配置和登录态要<b>重启服务 / 容器</b>之后才生效。
+      </n-alert>
+
+      <p class="text-[12.5px] muted mt-3 mb-0">
+        命令行也行：<code class="mono">docker exec pikpak-collector python -m tools.backup</code>
+        会在数据目录的 <code class="mono">backups/</code> 里生成归档；
+        还原用 <code class="mono">python -m tools.restore &lt;归档路径&gt;</code>。
+      </p>
     </n-card>
 
     <!-- 环境信息 -->

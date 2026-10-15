@@ -25,7 +25,16 @@ from app import transfer_router
 from app import telegram_bot
 from app import web_auth
 from app import web_public
-from app.routers import accounts, chats, links, listener, media, settings, static
+from app.routers import (
+    accounts,
+    backup,
+    chats,
+    links,
+    listener,
+    media,
+    settings,
+    static,
+)
 from app.routers.context import WebContext
 from app.store import Store
 from app.tg import TelegramSession
@@ -159,6 +168,7 @@ def create_app(cfg=None, tg_session=None) -> FastAPI:
         media.build_router(ctx),
         transfer_router.build_router(ctx),
         log_router.build_router(),
+        backup.build_router(ctx),
     ):
         app.include_router(router)
     # 静态路由必须最后注册，否则 /{filename} 兜底会挡住前面的接口

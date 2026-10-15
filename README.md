@@ -139,7 +139,7 @@ MTProto 代理说的是 MTProto 协议，代理不了 PikPak 的 HTTPS 请求，
 | 链接 | 工具栏筛选、表头排序、批量操作条、校验、隐藏、删除、复制、直接秒传 |
 | 媒体 | Telegram 缩略图瀑布流，点开看大图；原媒体跳转 Telegram，不缓存原文件 |
 | 秒传 | 粘贴链接批量建任务；可勾选要传的文件（支持按大小批量筛选）、暂停 / 终止 / 重试 |
-| 设置 | 应用凭据、Bot、PikPak、光鸭、秒传参数、代理池（系统代理 + 账号出口）、前台开关、环境信息、日志 |
+| 设置 | 应用凭据、Bot、PikPak、光鸭、秒传参数、代理池（系统代理 + 账号出口）、前台开关、备份与还原、环境信息、日志 |
 | 账号监控 | 左边账号列表，右边全部群组和监控开关；账号可编辑备注、手机号和绑定代理 |
 | 日志 | 采集日志和服务进程日志，自动刷新 |
 | 前台浏览 | 给访客看的只读卡片流，点一下复制链接 / 提取码。**不显示来源** |
@@ -218,6 +218,65 @@ MTProto 代理说的是 MTProto 协议，代理不了 PikPak 的 HTTPS 请求，
 媒体缩略图保存在 `media/thumbs/`，数据库保存媒体元数据。媒体采集默认关闭，
 需要在「账号监控」里对具体群组单独打开“媒体”开关。
 
+## 备份与还原
+
+换机器部署（本机 → 服务器、旧容器 → 新容器）不想重新配一遍，用这个：把整套数据
+打成一个归档，在新机器上还原回去就行。
+
+**归档里装什么**：`config.toml`（api_id / api_hash / 管理员密码）、`pikpak.db`
+（链接、备注、账号、代理、秒传任务、各种开关）、`session/`（Telegram 登录态，
+还原后不用重新登录）、`media/`（缩略图）、`shuju.json` / `data.js`（导出快照）。
+**只有 `logs/` 不进归档** —— 那是运行痕迹，换台机器没有意义。
+
+### 一键备份
+
+「设置 → 备份与还原 → 下载备份」直接下载一个 `pikpak-backup-<时间戳>.tar.gz`。
+命令行也行，归档会落到数据目录的 `backups/`：
+
+```bash
+# 本机
+python -m tools.backup
+
+# 容器里打完拷出来
+docker exec pikpak-collector python -m tools.backup
+docker cp pikpak-collector:/data/backups/<归档名> .
+```
+
+数据库是用 SQLite 的在线备份 API 取的，不是直接拷文件 —— WAL 里可能还有没落盘的
+事务，直接拷出来的库轻则丢数据，重则和残留的 `-wal` 对不上直接损坏。
+
+### 还原
+
+**新机器第一次部署**，推荐先还原再启动，省得起来一个空配置：
+
+```bash
+# 数据目录里放好归档，然后用容器里的还原命令（不启动服务）
+docker run --rm -v ./data:/data \
+  --entrypoint python ghcr.io/kongbai333/pikpakguangya:latest \
+  -m tools.restore /data/pikpak-backup-xxx.tar.gz
+
+docker compose up -d
+```
+
+**服务已经在跑**，就用设置页的「选择归档 → 还原」，或者：
+
+```bash
+docker cp pikpak-backup-xxx.tar.gz pikpak-collector:/data/
+docker exec pikpak-collector python -m tools.restore /data/pikpak-backup-xxx.tar.gz
+docker restart pikpak-collector
+```
+
+还原是**覆盖**而不是合并：归档里没有的登录态、缩略图会被删掉，免得两份数据混在
+一起。`config.toml` 和登录态是启动时读进内存的，**还原完必须重启服务 / 容器**才生效。
+归档会先解到临时目录、验完数据库再动现场数据，所以损坏的归档不会把你现有的库删一半。
+
+### 注意
+
+- 归档里有 `config.toml` 和 Telegram 登录态，**等同于账号密码**，别传给别人、别提交到仓库
+  （`backups/` 和 `*.tar.gz` 已经在 `.gitignore` / `.dockerignore` 里）。
+- `session/` 换机器后**不用重新登录**，但同一个账号在两个地方同时跑会互相挤掉线，
+  迁移时先把旧机器停掉。
+
 ## 主要接口
 
 ```text
@@ -242,6 +301,10 @@ GET    /api/listener                 所有账号的采集状态
 
 GET    /api/web-public               前台浏览页开关状态
 PUT    /api/web-public               打开 / 关闭前台浏览页
+
+GET    /api/backup                   备份内容清单（装什么、多大）
+GET    /api/backup/download          下载备份归档
+POST   /api/backup/restore           上传归档并还原
 ```
 
 `/api/items` 和 `/api/stats` 是仅有的两个对访客开放的接口，受前台开关控制；
@@ -255,6 +318,11 @@ PUT    /api/web-public               打开 / 关闭前台浏览页
 .\start.ps1           # 前台启动
 ```
 
+```powershell
+python -m tools.backup                  # 备份到数据目录的 backups/
+python -m tools.restore <归档路径>       # 从归档还原（日志不动，还原后重启）
+```
+
 ## 测试
 
 ```powershell
@@ -266,7 +334,7 @@ CI 会在每次 push / PR 时跑测试并构建前端，通过后才构建镜像
 
 ## 安全
 
-- `config.toml`、`session/`、`*.db` 和 `logs/` 都不要外传。
+- `config.toml`、`session/`、`*.db`、`logs/` 和 `backups/` 里的归档都不要外传。
 - Telegram 登录态文件等同于账号凭据。
 - 代理密码保存在本机 SQLite 数据库中。
 
