@@ -52,10 +52,27 @@ docker compose up -d
 ### 拉不动镜像怎么办
 
 `ghcr.io` 在国内经常拉不动（`context deadline exceeded`、进度条卡住不动）。镜像压缩后
-只有 60 MB 左右，卡住基本都是链路问题，不是镜像大。三条路，按省事程度排：
+只有 60 MB 左右，卡住基本都是链路问题，不是镜像大。四条路，按省事程度排：
 
-1. **换加速站拉，再改成官方名字**。改完名一定要打 tag，否则 compose / 面板会当成
-   另一个镜像，又跑去 ghcr.io 拉一遍：
+1. **NAS / 面板用户最省事：直接把 compose 里的 `image` 换成加速站地址**。不用打
+   tag，不用改别的地方，就换前缀：
+
+   ```yaml
+   image: ghcr.nju.edu.cn/kongbai333/pikpakguangya:latest
+   ```
+
+   实测能代理本镜像的加速站（把 `ghcr.io` 换成它们即可）：
+
+   | 加速站 | 说明 |
+   |---|---|
+   | `ghcr.nju.edu.cn` | 南京大学镜像，最稳，优先用这个 |
+   | `ghcr.dockerproxy.net` | 备选 |
+   | `ghcr.chenby.cn` / `ghcr.1ms.run` | 也能用，偶尔抽风 |
+
+   `ghcr.m.daocloud.io` 现在会拒绝不在白名单里的镜像，别用。
+
+2. **命令行拉的话，记得补一个官方名字的 tag**。只 `pull` 加速站的名字，compose /
+   面板里写的还是 `ghcr.io/...`，会被当成另一个镜像，又跑去 ghcr.io 拉一遍：
 
    ```bash
    docker pull ghcr.nju.edu.cn/kongbai333/pikpakguangya:latest
@@ -63,10 +80,7 @@ docker compose up -d
                ghcr.io/kongbai333/pikpakguangya:latest
    ```
 
-   备用站：`ghcr.dockerproxy.net`（前缀换成它，命令一样）。注意 `ghcr.m.daocloud.io`
-   现在会拒绝不在白名单里的镜像。
-
-2. **给 Docker 守护进程配代理**（服务器上有代理的话，一劳永逸）：
+3. **给 Docker 守护进程配代理**（服务器上有代理的话，一劳永逸）：
 
    ```bash
    sudo mkdir -p /etc/systemd/system/docker.service.d
@@ -82,7 +96,7 @@ docker compose up -d
    顺带一提：`/etc/docker/daemon.json` 里的 `registry-mirrors` **只对 Docker Hub
    （docker.io）生效**，配了它也不会加速 ghcr.io。
 
-3. **从能连的机器搬过去**：
+4. **从能连的机器搬过去**（NAS 的 Docker 面板一般都有「导入镜像」，可以直接喂这个 tar）：
 
    ```bash
    docker pull ghcr.io/kongbai333/pikpakguangya:latest
@@ -91,6 +105,18 @@ docker compose up -d
    # 服务器上
    gunzip -c /tmp/pikpak.tar.gz | docker load
    ```
+
+**想彻底绕开 ghcr.io**：镜像也支持同步到 Docker Hub（国内遍地都是 Docker Hub 加速器，
+比 ghcr 好拉得多）。在仓库 Settings → Secrets and variables → Actions 里加两个东西，
+之后每次 push 都会顺带推一份到 Docker Hub：
+
+| 类型 | 名称 | 值 |
+|---|---|---|
+| Variables | `DOCKERHUB_USERNAME` | 你的 Docker Hub 用户名 |
+| Secrets | `DOCKERHUB_TOKEN` | Access Token（权限只勾 Read & Write） |
+
+没配这两个的话，同步那一步会自动跳过，不影响 GHCR。配好之后 compose 里写
+`你的用户名/pikpakguangya:latest` 就行。
 
 ### 从源码跑（Windows）
 

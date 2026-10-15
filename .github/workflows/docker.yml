@@ -89,3 +89,52 @@ jobs:
           # 层缓存放 Actions 缓存里，第二次构建快很多
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ------------------------------------------------------------------
+  # 可选：同时同步到 Docker Hub。
+  #
+  # GHCR 在国内不少网络下拉不动（NAS、面板尤其明显），而 Docker Hub 满地都是
+  # 镜像加速器。想走这条路就在仓库 Settings → Secrets and variables → Actions
+  # 里加两个东西，加完这个 job 会自动启用：
+  #
+  #   Variables  DOCKERHUB_USERNAME = 你的 Docker Hub 用户名
+  #   Secrets    DOCKERHUB_TOKEN    = Access Token（只勾 Read & Write）
+  #
+  # 没配就整个 job 跳过，什么都不做。用户名放 Variables 而不是 Secrets，
+  # 是因为 job 级 if 读不到 secrets 上下文，只能读 vars。
+  # ------------------------------------------------------------------
+  dockerhub:
+    name: 同步到 Docker Hub
+    needs: test
+    if: ${{ github.event_name == 'push' && vars.DOCKERHUB_USERNAME != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ vars.DOCKERHUB_USERNAME }}/pikpakguangya
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 只读上面那个 job 写进 Actions 缓存的层，不重复写
+          cache-from: type=gha
