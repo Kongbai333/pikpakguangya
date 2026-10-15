@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -117,6 +119,27 @@ def test_public_web_toggle_closes_front_and_api(client):
     assert client.put("/api/web-public", json={"enabled": True}).json()["enabled"] is True
     assert client.get("/api/items").status_code == 200
     assert client.get("/").status_code == 200
+
+
+def test_closed_page_admin_link_is_reachable(client):
+    """关闭页上那个「进入管理后台」得真能进后台。
+
+    前端是 hash 路由，服务器只看得见 `/`。以前按钮写的是 `/#/admin`，
+    点一下等于再请求一次 `/`，又拿回这张关闭页 —— 库主被锁在门外。
+    """
+    client.put("/api/web-public", json={"enabled": False})
+
+    page = client.get("/")
+    assert page.status_code == 404
+    match = re.search(r'href="([^"]+)"', page.text)
+    assert match, "关闭页上没有给出进后台的链接"
+    href = match.group(1)
+    assert href.startswith("/admin"), href
+
+    # 链接指向的路径要真的吐前端入口，而不是又一张关闭页
+    entry = client.get(href.split("#")[0])
+    assert entry.status_code == 200
+    assert "浏览页已关闭" not in entry.text
 
 
 def test_public_web_toggle_requires_admin(client):

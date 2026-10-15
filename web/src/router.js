@@ -30,6 +30,13 @@ const routes = [
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]
 
+// 直接打开 `/admin`（容器启动日志和 README 里提示的就是这个地址）时 hash 是空的，
+// 路由会落到前台的浏览页 —— 而前台关掉之后那个页面根本打不开，人就被堵在门外。
+// 补成 hash 路由认识的地址，`/admin` 就能直接进后台。
+if (!window.location.hash && /\/admin\/?$/.test(window.location.pathname)) {
+  window.history.replaceState(null, '', `${window.location.pathname}#/admin`)
+}
+
 const router = createRouter({
   history: createWebHashHistory(),
   routes,

@@ -3,7 +3,7 @@
 关掉之后 `/` 不再返回浏览页，`/api/items`、`/api/stats` 和那几个静态数据文件
 也一并拒绝 —— 只藏页面不拦接口等于没关，数据照样能直接拉走。
 
-管理后台（`/#/admin`）不受影响：这是给库主自己看的，不是「前台」。
+管理后台（`/admin`）不受影响：这是给库主自己看的，不是「前台」。
 开关存在 state 表里，默认开，所以老库升级后行为不变。
 """
 
@@ -27,6 +27,11 @@ def set_enabled(store, enabled: bool) -> bool:
 
 # 关掉之后 / 上显示的东西。自带样式、不引外部资源 —— 前台已经关了，
 # 再让浏览器去拉一堆静态文件没有意义。
+#
+# 里面那个「进入管理后台」必须指向 `/admin#/admin`，不能写 `/#/admin`：
+# 前端是 **hash 路由**，服务器只看得见 `/`，写 `/#/admin` 等于再请求一次 `/`，
+# 又拿到这张关闭页 —— 点了像是没反应，库主反而被锁在门外。
+# `/admin` 这个路径是会吐前端入口的（见 routers/static.py）。
 CLOSED_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -77,7 +82,7 @@ CLOSED_HTML = """<!doctype html>
     <div class="mark">PK</div>
     <h1>浏览页已关闭</h1>
     <p>库主关掉了前台浏览。数据还在，只是不对外展示。</p>
-    <a href="/#/admin">进入管理后台</a>
+    <a href="/admin#/admin">进入管理后台</a>
   </div>
 </body>
 </html>
