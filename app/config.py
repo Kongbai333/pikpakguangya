@@ -115,14 +115,29 @@ class Config:
     app: AppConfig = field(default_factory=AppConfig)
     path: Path | None = None
 
+    def resolve_path(self, value: str) -> Path:
+        """把配置里的路径解析成绝对路径。
+
+        相对路径按**配置文件所在目录**解析，不是按代码目录。本机跑的时候配置就在
+        项目根目录，两者是同一个地方，行为不变；容器里配置在数据卷上
+        （`/data/config.toml`），用户把本机那份 config.toml 直接搬进去
+        （里面写的是 `pikpak.db` / `session/collector` 这种相对路径）也不会跑到
+        代码目录里去 —— 代码目录是镜像的一部分，容器一重建就没了，数据会凭空
+        「消失」。
+        """
+        p = Path(value)
+        if p.is_absolute():
+            return p
+        base = Path(self.path).parent if self.path else ROOT
+        return base / p
+
     def db_path(self) -> Path:
-        """数据库路径，相对路径按项目根目录解析。"""
-        p = Path(self.storage.db)
-        return p if p.is_absolute() else ROOT / p
+        """数据库路径。"""
+        return self.resolve_path(self.storage.db)
 
     def session_path(self) -> Path:
-        p = Path(self.telegram.session)
-        return p if p.is_absolute() else ROOT / p
+        """登录态文件路径（Telethon 会再补 `.session`）。"""
+        return self.resolve_path(self.telegram.session)
 
 def _build(cls: type[T], data: Any) -> T:
     if data is None:

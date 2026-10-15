@@ -408,18 +408,31 @@ def restore_archive(cfg, archive: Path | str, *, store=None) -> dict:
         applied: list[str] = []
         warnings: list[str] = []
 
+        # 还原之后配置说了算：归档里带了 config.toml，就用它算数据文件该放哪儿。
+        # 少了这一步，「先还原再首次启动」那条路（此时数据目录里还没有 config.toml）
+        # 只能拿默认值去猜，数据库会落到代码目录而不是数据卷上。
         staged_config = staging / CONFIG_NAME
+        final_config = (
+            Path(cfg.path) if getattr(cfg, "path", None)
+            else data_dir(cfg) / CONFIG_NAME
+        )
+        effective = cfg
         if staged_config.is_file():
-            target = (
-                Path(cfg.path) if getattr(cfg, "path", None)
-                else data_dir(cfg) / CONFIG_NAME
-            )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(staged_config, target)
+            try:
+                effective = config_module.load(staged_config)
+                # 相对路径要按**最终位置**解析，不能按临时解压目录
+                effective.path = final_config
+            except Exception as e:      # 配置坏了也要把别的数据还原回去
+                effective = cfg
+                warnings.append(
+                    f"归档里的 config.toml 读不出来（{e}），按当前配置还原"
+                )
+            final_config.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(staged_config, final_config)
             applied.append(CONFIG_NAME)
 
         if staged_db.is_file():
-            target = Path(cfg.db_path())
+            target = Path(effective.db_path())
             target.parent.mkdir(parents=True, exist_ok=True)
             swap = target.with_name(target.name + ".restore")
             shutil.copy2(staged_db, swap)
@@ -431,9 +444,13 @@ def restore_archive(cfg, archive: Path | str, *, store=None) -> dict:
                 with contextlib.suppress(OSError):
                     side.unlink()
             applied.append(DB_NAME)
+            if store is not None and Path(store.path) != target:
+                # 配置里的库路径和当前进程用的不一样（刚被还原的配置改的），
+                # 就地改掉，别让页面继续读一个空库
+                store.path = target
 
         for arcname, target_dir in (
-            (SESSION_DIRNAME, session_dir(cfg)),
+            (SESSION_DIRNAME, session_dir(effective)),
             (MEDIA_DIRNAME, media_dir()),
         ):
             staged = staging / arcname

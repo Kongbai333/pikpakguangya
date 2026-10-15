@@ -127,6 +127,65 @@ def test_restore_round_trip(tmp_path, media_root):
     assert not (backup.data_dir(target) / "logs" / "server.log").exists()
 
 
+def test_restore_into_fresh_data_dir_honors_restored_relative_paths(tmp_path, monkeypatch, media_root):
+    """容器首次启动：数据卷上还没有 config.toml，路径得靠还原带进来的那份算。
+
+    这是用户报的那个 bug —— 还原本机备份后页面是空的：配置里写的是相对路径
+    （`pikpak.db` / `session/collector`），旧代码把它们拼到**代码目录**上，
+    于是还原出来的库落在代码目录，数据卷上那份没人读。
+    """
+    # 备份源：本机那套，config.toml 里写的是相对路径
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source = config_module.Config(
+        telegram=config_module.TelegramConfig(session="session/collector"),
+        storage=config_module.StorageConfig(db="pikpak.db"),
+        checker=config_module.CheckerConfig(enabled=False),
+        admin=config_module.AdminConfig(password="test-admin"),
+        path=source_dir / "config.toml",
+    )
+    _seed(source)
+    archive = tmp_path / "backup.tar.gz"
+    backup.create_archive(source, archive)
+
+    # 目标容器：代码目录（镜像）和数据目录（数据卷）分开，数据目录里还没有配置
+    code = tmp_path / "code"
+    code.mkdir()
+    monkeypatch.setattr(config_module, "ROOT", code)
+    data = tmp_path / "data"
+    data.mkdir()
+    fresh = config_module.load(data / "config.toml")   # 不存在 → 默认值（相对路径）
+
+    result = backup.restore_archive(fresh, archive)
+
+    assert set(result["applied"]) >= {"config.toml", "pikpak.db", "session/"}
+    # 数据全落在数据卷上，代码目录里不留一份
+    assert (data / "pikpak.db").is_file()
+    assert (data / "session" / "collector.session").read_bytes() == b"session-bytes"
+    assert Store(data / "pikpak.db").stats()["shares"] == 1
+    assert not (code / "pikpak.db").exists()
+    assert not (code / "session").exists()
+
+
+def test_restore_points_live_store_at_restored_db(tmp_path, media_root):
+    """还原后当前进程要改读新库，否则页面继续查那个空库。"""
+    source = _cfg(tmp_path, root="source")
+    _seed(source)
+    archive = tmp_path / "backup.tar.gz"
+    backup.create_archive(source, archive)
+
+    target = _cfg(tmp_path, root="target")
+    Path(target.path).parent.mkdir(parents=True, exist_ok=True)
+    # 进程启动时用的是另一个路径的库（模拟配置被还原成别的落点）
+    live = Store(tmp_path / "target" / "other.db")
+    live.init()
+
+    backup.restore_archive(target, archive, store=live)
+
+    assert Path(live.path) == Path(target.db_path())
+    assert live.stats()["shares"] == 1
+
+
 def test_restore_replaces_stale_session_and_thumbs(tmp_path, media_root):
     source = _cfg(tmp_path, root="source")
     _seed(source)
