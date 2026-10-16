@@ -20,7 +20,7 @@ if ! grep -qE '^[[:space:]]*password[[:space:]]*=[[:space:]]*"[^"]+"' "$PIKPAK_C
     echo "[entrypoint] ⚠ $PIKPAK_CONFIG 里 [admin] password 还是空的，管理后台会拒绝登录。"
 fi
 
-echo "[entrypoint] 管理后台 http://<主机>:8000/#/admin"
+echo "[entrypoint] 管理后台 http://<主机>:8000/admin"
 echo "[entrypoint] 数据目录 $DATA_DIR"
 
 exec python -m app.api

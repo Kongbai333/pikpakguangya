@@ -44,7 +44,7 @@ docker compose up -d
 - `[telegram]` 的 `api_id` / `api_hash`
 - `[admin]` 的 `password` —— **留空的话管理后台一律拒绝登录**
 
-管理页：`http://<主机>:8000/#/admin`
+管理页：`http://<主机>:8000/admin`
 
 数据全在挂载出来的 `data/` 目录里（配置、SQLite 库、Telegram 登录态、日志、缩略图），
 删容器重建不会丢。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
@@ -131,7 +131,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Background
 ```
 
-管理页：`http://127.0.0.1:8000/#/admin`
+管理页：`http://127.0.0.1:8000/admin`
 
 首次使用顺序：
 
@@ -229,8 +229,9 @@ MTProto 代理说的是 MTProto 协议，代理不了 PikPak 的 HTTPS 请求，
 - `/api/items`、`/api/stats` 一律 403 —— **只藏页面不拦接口等于没关**，数据照样能直接拉走
 - `data.js` / `shuju.json` 这类导出的静态快照也一并停掉
 
-管理后台 `/admin#/admin` 不受影响，照常登录使用 —— 关掉前台后根地址只剩一个
-「浏览页已关闭」的提示，上面的按钮就指向它。想临时分享给别人看就打开，不想就关掉。
+管理后台 `/admin` 不受影响，照常登录使用。关闭页是**给访客看的**，上面故意不放
+进后台的入口（放个按钮等于告诉访客后台在哪儿、来试密码），所以自己访问走
+`/admin` 就行，建议存个书签。想临时分享给别人看就打开，不想就关掉。
 
 前台**不返回来源**（`source` 字段直接不吐给 `/api/items`）：它是采集到这条链接的群名，
 属于库主的隐私。管理页走 `/api/admin/links`，那边照旧有来源列和来源筛选。
@@ -371,6 +372,7 @@ POST   /api/accounts/{id}/collect    打开 / 关闭该账号的采集
 
 GET    /api/monitor                  账号及其监控群
 GET    /api/activity                 最近 N 分钟的采集活动（仪表盘实时监控用）
+GET    /api/admin/stats              管理后台的统计（与前台 /api/stats 分开，不受前台开关影响）
 GET    /api/logs                     采集 / 服务日志
 GET    /api/listener                 所有账号的采集状态
 

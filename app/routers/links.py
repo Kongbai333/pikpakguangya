@@ -51,6 +51,16 @@ def build_router(ctx: WebContext) -> APIRouter:
     def api_stats() -> dict:
         return {"status": 200, "stats": store.stats()}
 
+    @router.get("/api/admin/stats")
+    def api_admin_stats() -> dict:
+        """管理后台的统计，和前台那个 `/api/stats` 分开。
+
+        `/api/stats` 是**前台**用的：关掉前台浏览后它跟着 403（只藏页面不拦接口
+        等于没关）。管理后台要是也吃那一口，仪表盘就会跟着空掉 —— 库主自己反而
+        看不到数据。两边各走各的。
+        """
+        return {"status": 200, "stats": store.stats()}
+
     @router.get("/api/stats/daily")
     def api_stats_daily(days: int = Query(default=30, ge=2, le=365)) -> dict:
         """按天汇总，给仪表盘的走势图用。日期是 UTC。"""

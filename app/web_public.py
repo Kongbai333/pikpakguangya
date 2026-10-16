@@ -28,10 +28,9 @@ def set_enabled(store, enabled: bool) -> bool:
 # 关掉之后 / 上显示的东西。自带样式、不引外部资源 —— 前台已经关了，
 # 再让浏览器去拉一堆静态文件没有意义。
 #
-# 里面那个「进入管理后台」必须指向 `/admin#/admin`，不能写 `/#/admin`：
-# 前端是 **hash 路由**，服务器只看得见 `/`，写 `/#/admin` 等于再请求一次 `/`，
-# 又拿到这张关闭页 —— 点了像是没反应，库主反而被锁在门外。
-# `/admin` 这个路径是会吐前端入口的（见 routers/static.py）。
+# 这张页是**给外人看的**，所以上面不放任何进后台的入口 —— 给出按钮等于告诉
+# 访客「后台在这儿，来试密码」。库主自己走 `/admin`（见 routers/static.py），
+# 地址不变，存个书签就行。
 CLOSED_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -61,19 +60,11 @@ CLOSED_HTML = """<!doctype html>
   }
   h1 { margin: 0 0 8px; font-size: 19px; font-weight: 650; letter-spacing: -.2px; }
   p { margin: 0; color: #71717a; font-size: 13.5px; }
-  a {
-    display: inline-block; margin-top: 20px; padding: 9px 18px;
-    border-radius: 10px; background: #18181b; color: #fff;
-    font-size: 13.5px; font-weight: 500; text-decoration: none;
-  }
-  a:hover { background: #3f3f46; }
   @media (prefers-color-scheme: dark) {
     body { background: #111113; color: #e7e7ea; }
     .card { background: #1d1d20; border-color: #2c2c31; }
     .mark { background: #e7e7ea; color: #18181b; }
     p { color: #a1a1aa; }
-    a { background: #e7e7ea; color: #18181b; }
-    a:hover { background: #fff; }
   }
 </style>
 </head>
@@ -82,7 +73,6 @@ CLOSED_HTML = """<!doctype html>
     <div class="mark">PK</div>
     <h1>浏览页已关闭</h1>
     <p>库主关掉了前台浏览。数据还在，只是不对外展示。</p>
-    <a href="/admin#/admin">进入管理后台</a>
   </div>
 </body>
 </html>

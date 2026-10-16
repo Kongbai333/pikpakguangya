@@ -1075,8 +1075,9 @@ onUnmounted(() => {
         根地址 <code class="mono">/</code> 那个给访客看的只读浏览页。关掉之后，
         <b>页面和公开接口一起拒绝</b>（只藏页面不拦接口，数据照样能直接拉走），
         <code class="mono">data.js</code> 这类导出的静态快照也一并停掉。
-        管理后台 <code class="mono">/admin#/admin</code> 不受影响，只有你自己登录能看
-        —— 关掉之后根地址只剩一个提示页，上面就有进后台的按钮，别找不到路。
+        管理后台 <code class="mono">/admin</code> 不受影响，只有你自己登录能看。
+        关掉之后根地址只剩一张提示页，那页是给外人看的、**不放**进后台的入口，
+        自己访问走 <code class="mono">/admin</code>，建议存个书签。
       </p>
 
       <div class="flex flex-wrap items-center gap-4">

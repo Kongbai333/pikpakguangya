@@ -23,7 +23,6 @@ import {
 } from 'lucide-vue-next'
 
 import { fetchItems } from '../api'
-import { state } from '../store'
 import { copyText, fmtBytes, fmtTime, hasCode, rowStatus } from '../format'
 import EmptyState from '../components/EmptyState.vue'
 import SkeletonBlock from '../components/SkeletonBlock.vue'
@@ -35,6 +34,9 @@ const rows = ref([])
 const total = ref(0)
 const offline = ref(false)
 const error = ref('')
+// 统计跟着列表一起从 /api/items 拿（公开接口），不回后台那份全局状态 ——
+// 前台就是前台，只用公开的东西。
+const stats = ref(null)
 const copiedKey = ref('')
 const scrolled = ref(false)
 
@@ -52,7 +54,7 @@ const codeOptions = [
 ]
 
 const pageCount = computed(() => Math.max(1, Math.ceil(total.value / q.size)))
-const validCount = computed(() => state.stats?.ok ?? null)
+const validCount = computed(() => stats.value?.ok ?? null)
 
 /** 复制反馈：按钮短暂变成 ✓，1.2 秒后复原 */
 let copyTimer = null
@@ -107,6 +109,7 @@ async function load() {
     })
     rows.value = j.items || []
     total.value = j.total || 0
+    stats.value = j.stats || null
     offline.value = !!j.offline
     if (offline.value) {
       message.warning('接口拿不到，显示的是 data.js 里的静态快照（只读、不能搜索分页）')
@@ -115,6 +118,7 @@ async function load() {
     error.value = e.message
     rows.value = []
     total.value = 0
+    stats.value = null
   } finally {
     loading.value = false
   }
@@ -188,10 +192,10 @@ onUnmounted(() => {
               <span class="stat__k">条有效</span>
             </div>
           </template>
-          <template v-if="state.stats?.last_message_at">
+          <template v-if="stats?.last_message_at">
             <span class="stat__sep" />
             <div class="stat">
-              <span class="stat__n stat__n--sm">{{ fmtTime(state.stats.last_message_at) }}</span>
+              <span class="stat__n stat__n--sm">{{ fmtTime(stats.last_message_at) }}</span>
               <span class="stat__k">最后更新</span>
             </div>
           </template>

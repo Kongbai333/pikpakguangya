@@ -1,8 +1,12 @@
 /**
  * 全局状态：采集 / 账号 / 统计。
  *
- * 这三块状态浏览页和管理页都要看，所以放在一个 reactive 里统一轮询，
- * 免得两个页面各拉一份、互相打架。
+ * 轮询只在管理后台跑，这三块也都是后台要看的，所以放在一个 reactive 里统一拉，
+ * 免得各页各来一份、互相打架。前台浏览页是只读卡片流，它只用公开接口
+ * （`/api/items`），统计也从那边的响应里拿，不碰这里的东西。
+ *
+ * 统计走 `/api/admin/stats`：前台的 `/api/stats` 在关闭前台浏览后会一起 403，
+ * 管理后台要是吃同一口，仪表盘就跟着空了。
  */
 import { reactive, computed } from 'vue'
 import * as api from './api'
@@ -46,7 +50,7 @@ export async function loadAuth() {
 
 export async function loadStats() {
   try {
-    state.stats = (await api.get('/api/stats')).stats
+    state.stats = (await api.get('/api/admin/stats')).stats
     state.errors.stats = ''
   } catch (e) {
     setError('stats', e)

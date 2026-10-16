@@ -121,25 +121,43 @@ def test_public_web_toggle_closes_front_and_api(client):
     assert client.get("/").status_code == 200
 
 
-def test_closed_page_admin_link_is_reachable(client):
-    """关闭页上那个「进入管理后台」得真能进后台。
+def test_closed_page_has_no_admin_entry(client):
+    """关闭页是给外人看的，上面不能出现进后台的入口 —— 等于告诉访客后台在哪儿。
 
-    前端是 hash 路由，服务器只看得见 `/`。以前按钮写的是 `/#/admin`，
-    点一下等于再请求一次 `/`，又拿回这张关闭页 —— 库主被锁在门外。
+    库主自己走 `/admin`（另见 test_admin_entry_serves_spa_when_front_closed）。
     """
     client.put("/api/web-public", json={"enabled": False})
 
     page = client.get("/")
     assert page.status_code == 404
-    match = re.search(r'href="([^"]+)"', page.text)
-    assert match, "关闭页上没有给出进后台的链接"
-    href = match.group(1)
-    assert href.startswith("/admin"), href
+    assert "浏览页已关闭" in page.text
+    assert not re.search(r"<a\s", page.text), "关闭页上不该有链接"
+    assert "admin" not in page.text.lower(), "关闭页不该透露后台地址"
 
-    # 链接指向的路径要真的吐前端入口，而不是又一张关闭页
-    entry = client.get(href.split("#")[0])
+
+def test_admin_entry_serves_spa_when_front_closed(client):
+    """前台关掉后，`/admin` 仍然要吐前端入口，否则库主自己也被挡在外面。"""
+    client.put("/api/web-public", json={"enabled": False})
+
+    entry = client.get("/admin")
     assert entry.status_code == 200
     assert "浏览页已关闭" not in entry.text
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_admin_stats_survives_front_toggle(client, enabled):
+    """管理后台的统计走自己的接口，不受前台总开关影响。
+
+    以前两边共用 `/api/stats`：前台一关，仪表盘的数据跟着一起 403，库主自己
+    反而看不到。现在前台 `/api/stats` 关掉就拒，后台 `/api/admin/stats` 照常。
+    """
+    client.put("/api/web-public", json={"enabled": enabled})
+
+    admin = client.get("/api/admin/stats")
+    assert admin.status_code == 200, admin.text
+    assert admin.json()["stats"]["shares"] == 3
+
+    assert client.get("/api/stats").status_code == (200 if enabled else 403)
 
 
 def test_public_web_toggle_requires_admin(client):

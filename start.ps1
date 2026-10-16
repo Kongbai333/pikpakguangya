@@ -68,13 +68,13 @@ if ($Background) {
         -RedirectStandardError (Join-Path $logDir 'server.err.log')
     $p.Id | Set-Content -Path (Join-Path $root '.server.pid') -Encoding ascii
     Write-Host "已在后台启动（PID $($p.Id)）" -ForegroundColor Green
-    Write-Host '管理后台  http://127.0.0.1:8000/#/admin'
+    Write-Host '管理后台  http://127.0.0.1:8000/admin'
     Write-Host "日志      logs\server.out.log"
     Write-Host '停止      .\stop.ps1' -ForegroundColor DarkGray
     exit 0
 }
 
-Write-Host '管理后台  http://127.0.0.1:8000/#/admin' -ForegroundColor Green
+Write-Host '管理后台  http://127.0.0.1:8000/admin' -ForegroundColor Green
 Write-Host '展示页    http://127.0.0.1:8000/' -ForegroundColor Green
 Write-Host '登录 / 群组 / 采集都在这个进程里；Ctrl+C 停止（采集也一起停）' -ForegroundColor DarkGray
 Write-Host '想关掉终端还继续跑：.\start.ps1 -Background' -ForegroundColor DarkGray
@@ -83,7 +83,7 @@ Write-Host ''
 if (-not $NoBrowser) {
     Start-Job -ScriptBlock {
         Start-Sleep -Seconds 3
-        Start-Process 'http://127.0.0.1:8000/#/admin'
+        Start-Process 'http://127.0.0.1:8000/admin'
     } | Out-Null
 }
 
