@@ -27,6 +27,12 @@ class FakeMessage:
 
 
 class FakeClient:
+    """参数签名必须和 Telethon 真实方法一致（entity / messages / from_peer / as_album）。
+
+    早期这里写成 `message_ids=`，假 client 跟着一起错，测试全绿 ——
+    但真跑起来直接 TypeError。见 test_forward_call_matches_telethon_signature。
+    """
+
     def __init__(self, siblings: list | None = None, error: Exception | None = None):
         self.siblings = siblings or []
         self.error = error
@@ -37,13 +43,15 @@ class FakeClient:
         self.get_calls.append(list(ids or []))
         return self.siblings
 
-    async def forward_messages(self, entity=None, message_ids=None, from_peer=None):
+    async def forward_messages(self, entity=None, messages=None, from_peer=None,
+                               **kwargs):
         if self.error is not None:
             raise self.error
         self.forwards.append({
             "entity": entity,
-            "ids": list(message_ids or []),
+            "ids": list(messages or []),
             "from_peer": from_peer,
+            **kwargs,
         })
         return []
 
@@ -108,6 +116,8 @@ def test_album_is_forwarded_once(store):
     ))
     assert first == {"ok": True, "count": 2}
     assert client.forwards[0]["ids"] == [10, 11]
+    # 整组要用 as_album 转，否则到目标群会散成两条
+    assert client.forwards[0]["as_album"] is True
 
     # 相册里第二条消息也会触发事件，不能重复转
     second = asyncio.run(forwarder.forward_message(
@@ -116,6 +126,23 @@ def test_album_is_forwarded_once(store):
     ))
     assert second["skipped"] == "album"
     assert len(client.forwards) == 1
+
+
+def test_forward_call_matches_telethon_signature():
+    """用 Telethon 真正的方法签名 bind 一遍。
+
+    参数名写错（例如把 `messages=` 写成 `message_ids=`）在单元测试里很容易
+    被假 client 掩盖，真跑起来才炸。这里直接拿真签名卡住。
+    """
+    import inspect
+
+    from telethon import TelegramClient
+
+    signature = inspect.signature(TelegramClient.forward_messages)
+    signature.bind(
+        object(), entity=object(), messages=[1, 2], from_peer=object(),
+        as_album=True,
+    )
 
 
 def test_target_uses_access_hash_not_bare_id():
@@ -325,10 +352,11 @@ class FakeBotForwardClient:
     async def get_messages(self, chat, ids=None):
         return []
 
-    async def forward_messages(self, entity=None, message_ids=None, from_peer=None):
+    async def forward_messages(self, entity=None, messages=None, from_peer=None,
+                               **kwargs):
         if self.error is not None:
             raise self.error
-        self.forwards.append({"to": entity, "ids": list(message_ids or [])})
+        self.forwards.append({"to": entity, "ids": list(messages or [])})
         return []
 
 

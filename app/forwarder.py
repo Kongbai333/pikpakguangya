@@ -201,8 +201,13 @@ async def forward_message(client, chat, message, target: dict, *,
         return {"ok": False, "skipped": "no-target", "error": "转发目标群记录不完整"}
 
     try:
+        # 注意参数名：client 层是 messages=（Request 层才是 message_ids），
+        # 相册多传一个 as_album，转过去仍然是一条相册
         await client.forward_messages(
-            entity=entity, message_ids=ids, from_peer=chat,
+            entity=entity,
+            messages=ids,
+            from_peer=chat,
+            as_album=len(ids) > 1,
         )
     except Exception as e:
         return {"ok": False, "error": _describe(e), "count": 0}
@@ -257,7 +262,12 @@ async def forward_to_bot(client, chat, message, target: dict, *,
         return {"ok": False, "skipped": "empty", "error": "消息没有 id"}
 
     try:
-        await client.forward_messages(entity=peer, message_ids=ids, from_peer=chat)
+        await client.forward_messages(
+            entity=peer,
+            messages=ids,
+            from_peer=chat,
+            as_album=len(ids) > 1,
+        )
     except Exception as e:
         return {"ok": False, "error": _describe_bot(e), "count": 0}
 
