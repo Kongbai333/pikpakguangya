@@ -31,7 +31,6 @@ from app.routers import (
     chats,
     links,
     listener,
-    media,
     settings,
     static,
 )
@@ -165,7 +164,6 @@ def create_app(cfg=None, tg_session=None) -> FastAPI:
         links.build_router(ctx),
         listener.build_router(ctx),
         settings.build_router(ctx),
-        media.build_router(ctx),
         transfer_router.build_router(ctx),
         log_router.build_router(),
         backup.build_router(ctx),

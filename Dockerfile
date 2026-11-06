@@ -49,7 +49,8 @@ COPY docker/config.toml ./docker/config.toml
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --from=web /web/dist ./web/dist
 
-# 日志和缩略图在代码里是相对 ROOT 的路径，指到数据卷上。
+# 日志在代码里是相对 ROOT 的路径，指到数据卷上。
+# media 只为兼容老备份里的缩略图保留（媒体功能已移除，不会再往里面写）。
 # 放在构建期做（而不是 entrypoint 里 rm + ln）是为了能安全地 bind mount：
 # 运行时删目录会把挂载点一起删掉。
 RUN mkdir -p /data/logs /data/media /data/session \

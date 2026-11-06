@@ -46,7 +46,7 @@ docker compose up -d
 
 管理页：`http://<主机>:8000/admin`
 
-数据全在挂载出来的 `data/` 目录里（配置、SQLite 库、Telegram 登录态、日志、缩略图），
+数据全在挂载出来的 `data/` 目录里（配置、SQLite 库、Telegram 登录态、日志），
 删容器重建不会丢。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
 
 ### 拉不动镜像怎么办
@@ -211,7 +211,6 @@ MTProto 代理说的是 MTProto 协议，代理不了 PikPak 的 HTTPS 请求，
 |---|---|
 | 仪表盘 | 采集监控（雷达 + 实时活动条）、指标卡、每日走势、状态构成、来源构成 |
 | 链接 | 工具栏筛选、表头排序、批量操作条、校验、隐藏、删除、复制、直接秒传 |
-| 媒体 | Telegram 缩略图瀑布流，点开看大图；原媒体跳转 Telegram，不缓存原文件 |
 | 秒传 | 粘贴链接批量建任务；可勾选要传的文件（支持按大小批量筛选）、暂停 / 终止 / 重试 |
 | 设置 | 应用凭据、Bot、PikPak、光鸭、秒传参数、代理池（系统代理 + 账号出口）、前台开关、备份与还原、环境信息、日志 |
 | 账号监控 | 左边账号列表，右边全部群组和监控开关；账号可编辑备注、手机号和绑定代理 |
@@ -291,8 +290,8 @@ MTProto 代理说的是 MTProto 协议，代理不了 PikPak 的 HTTPS 请求，
 
 账号、代理池和链接数据都在 `pikpak.db`。`config.toml` 只保存 Telegram 凭据和存储配置。
 
-媒体缩略图保存在 `media/thumbs/`，数据库保存媒体元数据。媒体采集默认关闭，
-需要在「账号监控」里对具体群组单独打开“媒体”开关。
+媒体（图片 / 视频缩略图）采集已经移除，页面、接口和采集逻辑都不在了。
+老数据里的 `media/` 目录和 `media_items` 表不删也不读，想彻底清掉见下面的清理命令。
 
 ## 备份与还原
 
@@ -301,7 +300,8 @@ MTProto 代理说的是 MTProto 协议，代理不了 PikPak 的 HTTPS 请求，
 
 **归档里装什么**：`config.toml`（api_id / api_hash / 管理员密码）、`pikpak.db`
 （链接、备注、账号、代理、秒传任务、各种开关）、`session/`（Telegram 登录态，
-还原后不用重新登录）、`media/`（缩略图）、`shuju.json` / `data.js`（导出快照）。
+还原后不用重新登录）、`media/`（老版本的缩略图，只为兼容旧备份保留）、
+`shuju.json` / `data.js`（导出快照）。
 **只有 `logs/` 不进归档** —— 那是运行痕迹，换台机器没有意义。
 
 ### 一键备份
@@ -398,6 +398,14 @@ POST   /api/backup/restore           上传归档并还原
 ```powershell
 python -m tools.backup                  # 备份到数据目录的 backups/
 python -m tools.restore <归档路径>       # 从归档还原（日志不动，还原后重启）
+```
+
+之前开过媒体采集的库，媒体功能移除后剩下的缩略图和 `media_items` 表不会再被读写。
+想清掉（**先停服务**，删了就找不回来）：
+
+```powershell
+Remove-Item media -Recurse -Force
+.\\.venv\\Scripts\\python.exe -c "import sqlite3; c=sqlite3.connect('pikpak.db'); c.execute('DROP TABLE IF EXISTS media_items'); c.commit()"
 ```
 
 ## 测试

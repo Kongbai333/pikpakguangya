@@ -85,40 +85,9 @@ CREATE TABLE IF NOT EXISTS watched_chats (
   username   TEXT    NOT NULL DEFAULT '',
   kind       TEXT    NOT NULL DEFAULT '',
   enabled    INTEGER NOT NULL DEFAULT 1,
-  media_enabled INTEGER NOT NULL DEFAULT 0,
   added_at   TEXT    NOT NULL,
   PRIMARY KEY (account_id, chat_id)
 );
-
--- Telegram 媒体只保存元数据和本地缩略图，不缓存原图 / 视频。
-CREATE TABLE IF NOT EXISTS media_items (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  account_id    INTEGER NOT NULL DEFAULT 0,
-  chat_id       INTEGER NOT NULL,
-  chat_title    TEXT    NOT NULL DEFAULT '',
-  chat_username TEXT    NOT NULL DEFAULT '',
-  message_id    INTEGER NOT NULL,
-  grouped_id    INTEGER,
-  item_index    INTEGER NOT NULL DEFAULT 0,
-  media_type    TEXT    NOT NULL,
-  document_id   INTEGER,
-  access_hash   INTEGER,
-  file_name     TEXT    NOT NULL DEFAULT '',
-  mime_type     TEXT    NOT NULL DEFAULT '',
-  size_bytes    INTEGER,
-  width         INTEGER,
-  height        INTEGER,
-  duration_sec  INTEGER,
-  posted_at     TEXT    NOT NULL DEFAULT '',
-  thumb_path    TEXT    NOT NULL DEFAULT '',
-  thumb_status  TEXT    NOT NULL DEFAULT 'pending',
-  thumb_error   TEXT    NOT NULL DEFAULT '',
-  created_at    TEXT    NOT NULL,
-  UNIQUE (account_id, chat_id, message_id, item_index)
-);
-CREATE INDEX IF NOT EXISTS idx_media_created ON media_items(created_at);
-CREATE INDEX IF NOT EXISTS idx_media_chat ON media_items(chat_id);
-CREATE INDEX IF NOT EXISTS idx_media_type ON media_items(media_type);
 
 -- Telegram 账号：一个账号一个 session 文件。active=1 的是「当前使用」账号，
 -- 群列表、校验出口和 PikPak 详情走它；采集按各自的 collect_enabled 开关跑。
@@ -514,12 +483,6 @@ class Store:
                 "ALTER TABLE accounts ADD COLUMN collect_enabled INTEGER NOT NULL DEFAULT 0"
             )
             c.execute("UPDATE accounts SET collect_enabled = active")
-        wcols = {r["name"] for r in c.execute("PRAGMA table_info(watched_chats)")}
-        if wcols and "media_enabled" not in wcols:
-            c.execute(
-                "ALTER TABLE watched_chats ADD COLUMN media_enabled INTEGER NOT NULL DEFAULT 0"
-            )
-
         # watched_chats 里同一个群可能有两行（带 -100 和不带），统一成带 -100 的写法并合并。
         # 合并规则：enabled 取「有过启用」、标题/用户名/类型取第一个非空、added_at 取最早。
         rows = c.execute(
@@ -1581,6 +1544,22 @@ class Store:
             rows = c.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
+    def transfer_error_summary(self, job_id: int,
+                               limit: int = 3) -> list[tuple[str, int]]:
+        """失败明细的错误按出现次数归并，给通知用（不把上万条明细全捞出来）。
+
+        只算 failed：skipped 的 error 是「未命中/未勾选」这类说明，不是失败原因。
+        """
+        with self._read() as c:
+            rows = c.execute(
+                "SELECT error, COUNT(*) AS n FROM transfer_items"
+                " WHERE job_id = ? AND status = 'failed'"
+                "   AND IFNULL(error, '') <> ''"
+                " GROUP BY error ORDER BY n DESC, error LIMIT ?",
+                (int(job_id), max(1, min(int(limit or 3), 20))),
+            ).fetchall()
+        return [(str(row["error"]), int(row["n"])) for row in rows]
+
     def list_pending_transfer_items(self, job_id: int, after_id: int = 0,
                                     limit: int = 500) -> list[dict]:
         """按 id 分批取待处理明细，避免大任务一次性把全部明细和 Future 塞进内存。
@@ -1840,7 +1819,6 @@ class Store:
             "username": row["username"] or "",
             "kind": row["kind"] or "",
             "enabled": bool(row["enabled"]),
-            "media_enabled": bool(row["media_enabled"]) if "media_enabled" in row.keys() else False,
             "added_at": row["added_at"] or "",
         }
 
@@ -1886,39 +1864,6 @@ class Store:
             )
             return cur.rowcount > 0
 
-    def set_media_watched(self, chat_id: int, enabled: bool, title: str = "",
-                          username: str = "", kind: str = "",
-                          account_id: int | None = None) -> bool:
-        """单独控制某个群是否采集图片 / 视频。"""
-        owner = self._watch_owner(account_id)
-        cid = canonical_chat_id(chat_id)
-        with self._write() as c:
-            c.execute(
-                "INSERT INTO watched_chats"
-                " (account_id, chat_id, title, username, kind, enabled, media_enabled, added_at)"
-                " VALUES (?,?,?,?,?,0,?,?)"
-                " ON CONFLICT(account_id, chat_id) DO UPDATE SET"
-                " title = CASE WHEN excluded.title <> '' THEN excluded.title ELSE title END,"
-                " username = CASE WHEN excluded.username <> '' THEN excluded.username ELSE username END,"
-                " kind = CASE WHEN excluded.kind <> '' THEN excluded.kind ELSE kind END,"
-                " media_enabled = excluded.media_enabled",
-                (
-                    owner, cid, title or "", username or "", kind or "",
-                    1 if enabled else 0, iso(utcnow()),
-                ),
-            )
-            return True
-
-    def media_enabled(self, chat_id: int, account_id: int | None = None) -> bool:
-        owner = self._watch_owner(account_id)
-        with self._read() as c:
-            row = c.execute(
-                "SELECT media_enabled FROM watched_chats"
-                " WHERE account_id = ? AND chat_id = ?",
-                (owner, canonical_chat_id(chat_id)),
-            ).fetchone()
-        return bool(row and row["media_enabled"])
-
     def assign_orphan_watched(self) -> int:
         """把老库里 account_id=0 的监听记录归到当前账号。"""
         with self._write() as c:
@@ -1935,84 +1880,6 @@ class Store:
             moved = cur.rowcount
             c.execute("DELETE FROM watched_chats WHERE account_id = 0")
             return moved
-
-    # ---------- Telegram 媒体（缩略图 + 元数据） ----------
-    def upsert_media_item(self, item: dict) -> int:
-        fields = (
-            "account_id", "chat_id", "chat_title", "chat_username", "message_id",
-            "grouped_id", "item_index", "media_type", "document_id", "access_hash",
-            "file_name", "mime_type", "size_bytes", "width", "height",
-            "duration_sec", "posted_at", "created_at",
-        )
-        values = [item.get(name) for name in fields]
-        with self._write(invalidate=()) as c:
-            c.execute(
-                f"INSERT INTO media_items ({','.join(fields)})"
-                f" VALUES ({','.join('?' * len(fields))})"
-                " ON CONFLICT(account_id, chat_id, message_id, item_index) DO UPDATE SET"
-                " chat_title=excluded.chat_title, chat_username=excluded.chat_username,"
-                " grouped_id=excluded.grouped_id, media_type=excluded.media_type,"
-                " document_id=excluded.document_id, access_hash=excluded.access_hash,"
-                " file_name=excluded.file_name, mime_type=excluded.mime_type,"
-                " size_bytes=excluded.size_bytes, width=excluded.width,"
-                " height=excluded.height, duration_sec=excluded.duration_sec,"
-                " posted_at=excluded.posted_at",
-                values,
-            )
-            row = c.execute(
-                "SELECT id FROM media_items"
-                " WHERE account_id=? AND chat_id=? AND message_id=? AND item_index=?",
-                (
-                    item.get("account_id"), item.get("chat_id"), item.get("message_id"),
-                    item.get("item_index", 0),
-                ),
-            ).fetchone()
-            return int(row["id"])
-
-    def set_media_thumb(self, media_id: int, path: str = "",
-                        status: str = "ok", error: str = "") -> None:
-        with self._write(invalidate=()) as c:
-            c.execute(
-                "UPDATE media_items SET thumb_path=?, thumb_status=?, thumb_error=?"
-                " WHERE id=?",
-                (path or "", status, error, int(media_id)),
-            )
-
-    def list_media(self, page: int = 1, size: int = 60, media_type: str = "",
-                   chat_id: int | None = None, account_id: int | None = None) -> dict:
-        where, params = [], []
-        if media_type:
-            where.append("media_type = ?")
-            params.append(media_type)
-        if chat_id:
-            where.append("chat_id = ?")
-            params.append(canonical_chat_id(chat_id))
-        if account_id:
-            where.append("account_id = ?")
-            params.append(int(account_id))
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
-        size = max(1, min(int(size or 60), 200))
-        page = max(1, int(page or 1))
-        with self._read() as c:
-            total = int(c.execute(
-                "SELECT COUNT(*) AS n FROM media_items" + clause, params
-            ).fetchone()["n"])
-            rows = c.execute(
-                "SELECT * FROM media_items" + clause
-                + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-                params + [size, (page - 1) * size],
-            ).fetchall()
-        return {
-            "total": total, "page": page, "size": size,
-            "items": [dict(row) for row in rows],
-        }
-
-    def get_media(self, media_id: int) -> dict | None:
-        with self._read() as c:
-            row = c.execute(
-                "SELECT * FROM media_items WHERE id=?", (int(media_id),)
-            ).fetchone()
-        return dict(row) if row else None
 
     # ---------- Telegram 账号（一个账号一个 session 文件） ----------
     @staticmethod

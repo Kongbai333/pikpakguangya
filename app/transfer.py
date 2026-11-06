@@ -177,6 +177,29 @@ def _to_int(value: Any) -> int:
         return 0
 
 
+def join_reason(prefix: str, detail: str) -> str:
+    """拼「前缀：细节」，两段重复时只留一份。
+
+    光鸭的空间不足返回里 msg 常常就是「空间不足」，直接拼会变成
+    「光鸭空间不足：空间不足」，这句话会原样进任务说明和通知。
+    """
+    prefix = str(prefix or "").strip(" ：:")
+    detail = str(detail or "").strip(" ：:")
+    if not prefix:
+        return detail
+    if not detail:
+        return prefix
+    if detail in prefix:
+        return prefix
+    if prefix in detail:
+        return detail
+    # 「空间不足，请清理回收站」这种：第一个短句重复了前缀，就只留细节（信息更多）
+    head = re.split(r"[，,。；;：:]", detail, maxsplit=1)[0].strip()
+    if head and head in prefix:
+        return detail
+    return f"{prefix}：{detail}"
+
+
 def _gcid_of(file_info: dict) -> str:
     """从 PikPak 文件信息里找 GCID：hash 对象优先，其次平铺字段。"""
     for key in ("gcid", "cid"):
@@ -1143,7 +1166,9 @@ class TransferManager:
                 if result["status"] == "space":
                     # 空间不足是账号级问题，继续传每个都会失败
                     stop.set()
-                    stop_reason.append(f"光鸭空间不足：{result['error']}")
+                    stop_reason.append(
+                        join_reason("光鸭空间不足", result.get("error"))
+                    )
                     return item, "failed", result["error"]
                 return item, "failed", result["error"]
             except GuangyaAuthError as e:

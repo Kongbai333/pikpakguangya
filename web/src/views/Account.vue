@@ -153,25 +153,6 @@ async function toggleWatch(row, enabled) {
   }
 }
 
-async function toggleMedia(row, enabled) {
-  if (!selected.value) return
-  try {
-    await api.post('/api/watch/media', {
-      chat_id: row.chat_id,
-      account_id: selected.value.id,
-      enabled,
-      title: row.title || '',
-      username: row.username || '',
-      kind: row.kind || '',
-    })
-    row.media_enabled = enabled
-    message.success(enabled ? '已开启媒体采集' : '已关闭媒体采集')
-    await load()
-  } catch (e) {
-    message.error(e.message)
-  }
-}
-
 function chatStat(row) {
   const key = String(row.chat_id || '').replace(/^-/, '').replace(/^100/, '')
   const hit = (selected.value?.watched || []).find((x) => {
@@ -212,18 +193,6 @@ const chatColumns = computed(() => [
         value: !!row.watched,
         size: 'small',
         onUpdateValue: (v) => toggleWatch(row, v),
-      }),
-  },
-  {
-    title: '媒体',
-    key: 'media',
-    width: 80,
-    align: 'center',
-    render: (row) =>
-      h(NSwitch, {
-        value: !!row.media_enabled,
-        size: 'small',
-        onUpdateValue: (v) => toggleMedia(row, v),
       }),
   },
 ])

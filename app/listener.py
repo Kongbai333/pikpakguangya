@@ -18,7 +18,6 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from app import media as media_module
 from app.parser import CodeMerger, keep_message
 from app.proxy import ProxyConfig, proxy_from_account
 from app.store import Store, iso, utcnow
@@ -188,13 +187,8 @@ async def _ingest(obj: Any, chat: Any, store: Store, merger: CodeMerger, cfg,
         return {"skipped": "sender"}
     chat_id = int(getattr(chat, "id", 0) or getattr(msg, "chat_id", 0) or 0)
     account_id = int(account_id or 0)
-    media_ids = []
-    if account_id and store.media_enabled(chat_id, account_id):
-        media_ids = await media_module.collect(
-            msg, chat, store, account_id, _chat_title(chat)
-        )
     if not text.strip():
-        return {"skipped": "empty", "media_ids": media_ids}
+        return {"skipped": "empty"}
 
     result = process_message(
         store, merger,
@@ -209,7 +203,6 @@ async def _ingest(obj: Any, chat: Any, store: Store, merger: CodeMerger, cfg,
         exclude=c.keywords_exclude,
         ignore_senders=c.ignore_senders,
     )
-    result["media_ids"] = media_ids
     for s in result.get("saved", []):
         if s["update_only"]:
             log.debug("补码 %s -> %s", s["link_id"], s["pass_code"])
@@ -330,7 +323,7 @@ def watch_specs(store: Store, cfg, account: dict | None) -> tuple[list, str]:
     acc = account or {}
     account_id = int(acc.get("id") or 0)
     watched = store.list_watched(account_id=account_id or None)
-    active = [w for w in watched if w["enabled"] or w["media_enabled"]]
+    active = [w for w in watched if w["enabled"]]
     if active:
         owner = acc.get("name") or acc.get("alias") or acc.get("phone") or ""
         return [int(w["chat_id"]) for w in active], f"数据库（{owner} 的勾选）"

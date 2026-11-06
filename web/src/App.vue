@@ -9,7 +9,6 @@ import { darkTheme, dateZhCN, zhCN } from 'naive-ui'
 import {
   ArrowUp,
   CloudUpload,
-  Image,
   LayoutDashboard,
   Link2,
   LogOut,
@@ -49,7 +48,6 @@ const NAV = [
     items: [
       { to: '/admin', label: '仪表盘', icon: LayoutDashboard, names: ['dashboard'] },
       { to: '/admin/links', label: '链接', icon: Link2, names: ['links'] },
-      { to: '/admin/media', label: '媒体', icon: Image, names: ['media'] },
       { to: '/admin/transfers', label: '秒传', icon: CloudUpload, names: ['transfers'] },
     ],
   },
@@ -74,7 +72,6 @@ const TITLES = {
   login: ['管理员登录', ''],
   dashboard: ['仪表盘', '采集、账号、链接的整体状态'],
   links: ['链接管理', '校验、筛选、隐藏、删除'],
-  media: ['媒体瀑布流', '只缓存缩略图，原媒体跳转 Telegram'],
   transfers: ['秒传到光鸭', 'PikPak 分享按 GCID 秒传到光鸭云盘'],
   logs: ['日志', '每个账号的采集日志和服务日志'],
   account: ['账号与监控', '采集开关、代理、群组勾选都按账号走'],

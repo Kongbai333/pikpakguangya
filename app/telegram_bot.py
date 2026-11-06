@@ -166,6 +166,12 @@ def _target_folder(job: dict) -> str:
     return folder_id or "根目录"
 
 
+def _one_line(value: Any, limit: int = 200) -> str:
+    """压掉换行和多余空白并截断 —— 通知里一条原因只能占一行。"""
+    text = " ".join(str(value or "").split())
+    return text[:limit]
+
+
 class TelegramBotRunner:
     """后台长轮询器。配置保存后由设置接口主动重启。"""
 
@@ -1701,8 +1707,11 @@ class TelegramBotRunner:
             conf, client, state,
         )
         status_label = TRANSFER_STATUS_LABELS.get(status, status or "未知")
+        # 失败的任务把原因也写进摘要卡：那张卡是用户最先看到的消息
+        reason = "" if status == "finished" else self._job_reason(job)
         await self._upsert_task_message(
-            "summary_messages", job_id, self._summary_text(job, status_label),
+            "summary_messages", job_id,
+            self._summary_text(job, status_label, reason),
             conf, client, state,
         )
         state["progress_messages"].pop(str(job_id), None)
@@ -1791,12 +1800,13 @@ class TelegramBotRunner:
         return message_id
 
     @staticmethod
-    def _summary_text(job: dict, state_text: str = "正在秒传") -> str:
+    def _summary_text(job: dict, state_text: str = "正在秒传",
+                      reason: str = "") -> str:
         job_id = int(job.get("id") or 0)
         name = " ".join(
             str(job.get("title") or job.get("share_url") or f"任务 #{job_id}").split()
         )[:120]
-        return "\n".join([
+        lines = [
             "📥 <b>PikPak 秒传任务已解析</b>",
             "━━━━━━━━━━━━━━",
             f"📄 标题：<b>{html.escape(name)}</b>",
@@ -1805,10 +1815,34 @@ class TelegramBotRunner:
             f"📂 目标目录：<code>{html.escape(_target_folder(job))}</code>",
             f"🆔 任务编号：<code>#{job_id}</code>",
             f"🔄 状态：<b>{html.escape(state_text)}</b>",
-        ])
+        ]
+        if reason:
+            lines.append(f"⚠️ 原因：<b>{html.escape(reason)}</b>")
+        return "\n".join(lines)
 
     @staticmethod
-    def _completion_text(job: dict) -> str:
+    def _job_reason(job: dict) -> str:
+        """任务的收尾说明，用来回答「为什么没完成」。
+
+        网页上那句「任务已停止：光鸭空间不足」就存在 transfer_jobs.message 里，
+        Bot 以前只报一句「失败」，用户看不到原因。已完成的任务不重复说明。
+        """
+        status = str(job.get("status") or "")
+        # 已完成没有「为什么失败」可说；已取消/已终止的状态标签本身就说明了事由
+        if status in ("finished", "canceled"):
+            return ""
+        reason = _one_line(job.get("message"), 200)
+        label = TRANSFER_STATUS_LABELS.get(status, status or "")
+        # 说明和状态标签撞了只留状态，免得「状态：失败」下面又一行「原因：失败」
+        return "" if reason == label else reason
+
+    def _failure_reasons(self, job_id: int) -> list[tuple[str, int]]:
+        """失败明细的原因（按出现次数归并），让「失败 110 个」能看出为什么。"""
+        if job_id <= 0:
+            return []
+        return self.store.transfer_error_summary(job_id)
+
+    def _completion_text(self, job: dict) -> str:
         job_id = int(job.get("id") or 0)
         name = " ".join(
             str(job.get("title") or job.get("share_url") or f"任务 #{job_id}").split()
@@ -1816,27 +1850,33 @@ class TelegramBotRunner:
         name = html.escape(name)
         target = html.escape(_target_folder(job))
         status = str(job.get("status") or "")
-        if status != "finished":
+        failed = int(job.get("failed_files") or 0)
+        finished = status == "finished"
+        lines = [
+            (f"✅ <b>PikPak秒传光鸭 秒传完成：{name}</b>" if finished
+             else f"❌ <b>PikPak秒传光鸭 任务未完成：{name}</b>"),
+            "━━━━━━━━━━━━━━",
+        ]
+        if not finished:
             label = TRANSFER_STATUS_LABELS.get(status, status or "未知")
-            return (
-                f"❌ <b>PikPak秒传光鸭 任务未完成：{name}</b>\n"
-                "━━━━━━━━━━━━━━\n"
-                f"状态：{html.escape(label)}\n"
-                f"✅ 成功 {int(job.get('completed_files') or 0)} 个，"
-                f"❌ 失败 {int(job.get('failed_files') or 0)} 个\n"
-                f"📦 总体积：{_fmt_bytes(job.get('total_bytes'))}\n"
-                f"📦 成功体积：{_fmt_bytes(job.get('completed_bytes'))}\n"
-                f"📂 目标目录 ID：{target}"
-            )
-        return (
-            f"✅ <b>PikPak秒传光鸭 秒传完成：{name}</b>\n"
-            "━━━━━━━━━━━━━━\n"
+            lines.append(f"状态：{html.escape(label)}")
+            reason = self._job_reason(job)
+            if reason:
+                lines.append(f"原因：<b>{html.escape(reason)}</b>")
+        lines.append(
             f"✅ 成功 {int(job.get('completed_files') or 0)} 个，"
-            f"❌ 失败 {int(job.get('failed_files') or 0)} 个\n"
-            f"📦 总体积：{_fmt_bytes(job.get('total_bytes'))}\n"
-            f"📦 成功体积：{_fmt_bytes(job.get('completed_bytes'))}\n"
-            f"📂 目标目录 ID：{target}"
+            f"❌ 失败 {failed} 个"
         )
+        if failed:
+            for error, count in self._failure_reasons(job_id):
+                detail = html.escape(_one_line(error, 120))
+                lines.append(f"⚠️ {detail}（{count} 个）")
+        lines.extend([
+            f"📦 总体积：{_fmt_bytes(job.get('total_bytes'))}",
+            f"📦 成功体积：{_fmt_bytes(job.get('completed_bytes'))}",
+            f"📂 目标目录 ID：{target}",
+        ])
+        return "\n".join(lines)
 
     @staticmethod
     def _progress_text(job: dict, event: dict | None = None) -> str:

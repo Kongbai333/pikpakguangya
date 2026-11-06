@@ -19,7 +19,8 @@ const routes = [
       { path: 'monitor', redirect: '/admin/account' },
       { path: 'chats', redirect: '/admin/account' },
       { path: 'links', name: 'links', component: () => import('./views/Links.vue') },
-      { path: 'media', name: 'media', component: () => import('./views/Media.vue') },
+      // 媒体页已移除；旧书签跳到仪表盘，总比落到前台浏览页强
+      { path: 'media', redirect: '/admin' },
       { path: 'transfers', name: 'transfers', component: () => import('./views/Transfers.vue') },
       { path: 'logs', name: 'logs', component: () => import('./views/Logs.vue') },
       { path: 'proxy', redirect: '/admin/settings' },

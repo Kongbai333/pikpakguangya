@@ -335,3 +335,17 @@ def test_logs_content_and_log_files_are_different_endpoints(client):
 
     files = client.get("/api/logs/files").json()
     assert "files" in files and "retention_days" in files
+
+
+def test_media_feature_is_gone(client):
+    """媒体功能已整体移除：接口、开关、路由都不该偷偷留下来。"""
+    paths = {
+        getattr(route, "path", "") for route in _iter_api_routes(client.app)
+    }
+    assert not [p for p in paths if "media" in p.lower()]
+
+    # 真发一次：既不能命中旧接口，也不能被静态页的兜底接走
+    assert client.get("/api/media").status_code == 404
+    assert client.post(
+        "/api/watch/media", json={"chat_id": -100123, "enabled": True}
+    ).status_code == 404

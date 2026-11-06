@@ -62,7 +62,6 @@ def build_router(ctx: WebContext) -> APIRouter:
                 d = dict(c)
                 w = by_id.get(d.get("chat_id"))
                 d["watched"] = bool(w and w["enabled"])
-                d["media_enabled"] = bool(w and w.get("media_enabled"))
                 out.append(d)
             return out
 
@@ -133,18 +132,6 @@ def build_router(ctx: WebContext) -> APIRouter:
             "enabled": bool(payload.enabled),
         }
 
-    @router.post("/api/watch/media")
-    def api_watch_media(payload: WatchToggleIn) -> dict:
-        store.set_media_watched(
-            payload.chat_id,
-            payload.enabled,
-            title=payload.title,
-            username=payload.username,
-            kind=payload.kind,
-            account_id=payload.account_id,
-        )
-        return {"status": 200, "media_enabled": bool(payload.enabled)}
-
     @router.get("/api/monitor")
     def api_monitor() -> dict:
         """**不连 Telegram** —— 页面会定期刷，只读数据库 + 采集状态。
@@ -168,7 +155,7 @@ def build_router(ctx: WebContext) -> APIRouter:
 
         by_acc: dict[int, list[dict]] = {}
         for w in store.list_watched_all():
-            if w["enabled"] or w["media_enabled"]:
+            if w["enabled"]:
                 by_acc.setdefault(w["account_id"], []).append(w)
 
         active_id = (tg.account() or {}).get("id")
