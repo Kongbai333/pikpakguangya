@@ -120,28 +120,32 @@ def build_router(ctx: WebContext) -> APIRouter:
                     status_code=400,
                     detail="还没配置 Bot Token（设置 → Telegram Bot），bot 中转用不了",
                 )
+            # 先用 Telethon 拿到 peer：普通群在这里要做一次 chat_id 换算
+            peer = await ctx.call(
+                ctx.session_for(account).forward_target_peer(body.chat_id)
+            )
+            bot_chat = forwarder.bot_chat_id(peer)
             try:
                 me = await bot_api.get_me(token, ctx.system_proxy())
-                chat = await bot_api.get_chat(token, int(body.chat_id), ctx.system_proxy())
+                chat = await bot_api.get_chat(token, bot_chat, ctx.system_proxy())
             except bot_api.BotApiError as e:
+                # getChat 能过说明 id 和成员身份都对；过不了当场报，别等转发才发现
                 raise HTTPException(
                     status_code=400, detail=f"bot 进不了这个群：{e}"
                 ) from e
-            title = str(chat.get("title") or "").strip()
+            title = str(chat.get("title") or "").strip() or str(peer.get("title") or "")
             forwarder.save_target(
                 store, aid,
-                chat_id=int(chat.get("id") or body.chat_id),
-                raw_id=0,
-                access_hash=0,
+                chat_id=bot_chat,
+                raw_id=peer["raw_id"],
+                access_hash=peer.get("access_hash"),
                 title=title,
-                kind="bot",
+                kind=peer.get("kind") or "channel",
                 mode="bot",
                 bot_username=str(me.get("username") or ""),
                 bot_user_id=int(me.get("id") or 0),
             )
-            forwarder.save_relay_target(
-                store, chat_id=int(chat.get("id") or body.chat_id), title=title,
-            )
+            forwarder.save_relay_target(store, chat_id=bot_chat, title=title)
             return snapshot(body.account_id)
 
         # 直连：从 Telethon 那边取 raw_id / access_hash

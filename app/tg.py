@@ -531,10 +531,12 @@ class TelegramSession:
         }
 
     async def list_forward_candidates(self) -> list[dict]:
-        """可以当转发目标的群组：超级群，或有发帖权限的频道。
+        """可以当转发目标的群组：有发帖权限的超级群 / 频道 / 普通群。
 
-        普通群不列：超过 200 人 Telegram 会强制升级成超级群，**id 会变**，
-        存下来的目标就废了。广播频道也只有管理员能发，没权限的不列。
+        普通群也列（自己几个人用很常见）：`kind="群"`，转过去走
+        `InputPeerChat`。注意它超过 200 人时 Telegram 会强制升级成超级群、
+        id 会变，那时需要重新绑定一次。
+        广播频道只有管理员能发，没权限的不列。
         """
         client = await self.require_authorized()
         out: list[dict] = []
@@ -545,20 +547,27 @@ class TelegramSession:
                     continue
                 broadcast = bool(getattr(entity, "broadcast", False))
                 megagroup = bool(getattr(entity, "megagroup", False))
-                if not (broadcast or megagroup):
-                    continue
                 rights = getattr(entity, "admin_rights", None)
-                can_post = (
-                    not broadcast
-                    or bool(getattr(entity, "creator", False))
-                    or bool(getattr(rights, "post_messages", False))
-                )
-                if not can_post:
-                    continue
+                if broadcast:
+                    can_post = (
+                        bool(getattr(entity, "creator", False))
+                        or bool(getattr(rights, "post_messages", False))
+                    )
+                    if not can_post:
+                        continue
+                    kind = "频道"
+                    chat_id = int(f"-100{int(entity.id)}")
+                elif megagroup:
+                    kind = "超级群"
+                    chat_id = int(f"-100{int(entity.id)}")
+                else:
+                    # 普通群：Telethon 给正数 id，自己算成 -100… 会错
+                    kind = "群"
+                    chat_id = int(entity.id)
                 out.append({
-                    "chat_id": int(f"-100{int(entity.id)}"),
+                    "chat_id": chat_id,
                     "title": dialog.name or "",
-                    "kind": "频道" if broadcast else "超级群",
+                    "kind": kind,
                 })
         except Exception as e:
             raise LoginError(_friendly(e)) from e

@@ -261,7 +261,7 @@ async function loadForwardCandidates() {
     })
     forwardCandidates.value = data.chats || []
     if (!forwardCandidates.value.length) {
-      message.warning('这个账号没有可用作转发目标的超级群/频道（普通群不列，升级后 id 会变）')
+      message.warning('这个账号没有可用作转发目标的群组/频道')
     }
   } catch (e) {
     message.error(e.message)
@@ -811,7 +811,7 @@ usePolling(load, 10000)
               filterable
               clearable
               :options="forwardCandidates.map((c) => ({ label: `${c.title} · ${c.kind}`, value: c.chat_id }))"
-              placeholder="已有超级群 / 频道"
+              placeholder="已有群组 / 频道"
               :loading="forwardBusy === 'candidates'"
               @focus="loadForwardCandidates"
             />
@@ -833,7 +833,8 @@ usePolling(load, 10000)
               发测试消息
             </n-button>
             <span class="text-[12px] muted">
-              账号被限制建群（spamreported）时，绑一个已有的超级群/频道也能转发
+              账号被限制建群（spamreported）时，绑一个已有群组也能转发；
+              普通群也行，但超过 200 人会被升级成超级群、需要重新绑
             </span>
           </div>
           <div v-if="forward.stats.last_error" class="text-[12px] text-[var(--app-danger)] mt-1">

@@ -232,11 +232,10 @@ def make_session(store, client):
     return session
 
 
-def test_candidates_only_include_where_we_can_post(store):
+def test_candidates_include_where_we_can_post(store):
     client = FakeDialogsClient([
-        # 普通群：超过 200 人会被升级、id 会变，不列入
+        # 普通群：也列（自己几个人用很常见）
         FakeDialog(FakeEntity(11), "普通群", is_group=True),
-        # 超级群：可以
         FakeDialog(FakeEntity(22, megagroup=True), "超级群A", is_group=True),
         # 广播频道但没发帖权限：不列
         FakeDialog(FakeEntity(33, broadcast=True), "广播频道B", is_channel=True),
@@ -247,8 +246,30 @@ def test_candidates_only_include_where_we_can_post(store):
     ])
     session = make_session(store, client)
     chats = asyncio.run(session.list_forward_candidates())
-    assert [c["title"] for c in chats] == ["合作频道", "我的频道", "超级群A"]
-    assert all(c["chat_id"] < 0 for c in chats)
+
+    kinds = {c["title"]: c["kind"] for c in chats}
+    assert kinds == {
+        "普通群": "群",
+        "超级群A": "超级群",
+        "我的频道": "频道",
+        "合作频道": "频道",
+    }
+    # 没发帖权限的广播频道不能当目标
+    assert "广播频道B" not in kinds
+
+    ids = {c["title"]: c["chat_id"] for c in chats}
+    assert ids["普通群"] == 11                 # 普通群保留 Telethon 侧正数 id
+    assert ids["超级群A"] == -10022
+
+
+def test_bot_chat_id_converts_basic_group():
+    """Bot API 里普通群的 chat_id 是 Telethon 那个正数 id 的负数。"""
+    assert forwarder.bot_chat_id({
+        "kind": "channel", "chat_id": -1001234567890, "raw_id": 1234567890,
+    }) == -1001234567890
+    assert forwarder.bot_chat_id({
+        "kind": "chat", "chat_id": 987654321, "raw_id": 987654321,
+    }) == -987654321
 
 
 def test_bind_existing_group_target(store):

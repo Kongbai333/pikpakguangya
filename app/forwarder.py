@@ -147,6 +147,20 @@ async def album_ids(client, chat, message) -> list[int]:
     return sorted(picked) or [message_id]
 
 
+def bot_chat_id(peer: dict) -> int:
+    """把 Telethon 那边的 peer 换成 Bot API 用的 chat_id。
+
+    超级群/频道的 `-100…` 两边一致；**普通群** Telethon 给正数（如 123456789），
+    Bot API 那边是它的负数（-123456789）。
+    这个换算绑定时会用 `getChat` 再验一次，转错会当场报错，不会发到错的群。
+    """
+    chat_id = int(peer.get("chat_id") or 0)
+    raw_id = int(peer.get("raw_id") or 0)
+    if str(peer.get("kind") or "") == "chat" and raw_id:
+        return -raw_id
+    return chat_id
+
+
 def _target_entity(target: dict):
     """用 raw_id + access_hash 拼一个 InputPeer。
 
