@@ -276,6 +276,13 @@ class Collector:
         if not target.get("chat_id"):
             return
         if not forwarder.detect_video(msg):
+            # 顺手记下跳过了什么（表情/GIF/图片），别再出现「为什么这条没转」的疑问
+            kind = forwarder.media_kind(msg)
+            if kind != "无媒体":
+                log.debug(
+                    "跳过非视频消息 chat=%s msg=%s 类型=%s",
+                    chat_id, getattr(msg, "id", 0), kind,
+                )
             return
 
         try:

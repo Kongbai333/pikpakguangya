@@ -105,13 +105,58 @@ def note_result(store, account_id: int, *, ok: bool, error: str = "",
 
 
 def detect_video(message: Any) -> bool:
-    """这条消息里有没有视频（普通视频 / 视频文件 / 动态图都算）。"""
+    """这条消息里是不是**真视频**（含圆视频、以文件发出的视频）。
+
+    表情包要优先排除：Telegram 的 video 表情（.webm）同时带
+    `DocumentAttributeSticker` 和 `DocumentAttributeVideo`，
+    Telethon 的 `message.video` 对两者都返回真 —— 先看 video 就会把表情
+    当视频转走。GIF（DocumentAttributeAnimated）也不算，它在 Bot API 那边
+    是 `animation` 字段，不排除的话两边口径又对不上。
+
+    口径必须和 `telegram_bot._is_video_message`（Bot API 侧）保持一致，
+    否则会变成「采集侧转了、bot 丢掉」这种一半成功的状态。
+    """
+    if getattr(message, "sticker", None) is not None:
+        return False
+    if getattr(message, "gif", None) is not None:
+        return False
+    if getattr(message, "video_note", None) is not None:
+        return True
     if getattr(message, "video", None) is not None:
         return True
+
     doc = getattr(message, "document", None)
     if doc is None:
         return False
-    return str(getattr(doc, "mime_type", "") or "").startswith("video/")
+    if not str(getattr(doc, "mime_type", "") or "").startswith("video/"):
+        return False
+    # 再防一层：属性里带表情 / 自定义 emoji / GIF 的也不算
+    for attr in getattr(doc, "attributes", None) or []:
+        if type(attr).__name__ in (
+            "DocumentAttributeSticker",
+            "DocumentAttributeCustomEmoji",
+            "DocumentAttributeAnimated",
+        ):
+            return False
+    return True
+
+
+def media_kind(message: Any) -> str:
+    """给人看的媒体类型，只用日志和诊断，不参与判断。"""
+    if getattr(message, "sticker", None) is not None:
+        return "表情"
+    if getattr(message, "gif", None) is not None:
+        return "GIF"
+    if getattr(message, "video", None) is not None:
+        return "视频"
+    if getattr(message, "video_note", None) is not None:
+        return "圆视频"
+    if getattr(message, "photo", None) is not None:
+        return "图片"
+    doc = getattr(message, "document", None)
+    if doc is not None:
+        return f"文件({getattr(doc, 'mime_type', '') or '未知'})"
+    return "无媒体"
 
 
 def _describe(error: Exception) -> str:

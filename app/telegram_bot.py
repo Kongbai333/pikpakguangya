@@ -1269,6 +1269,14 @@ class TelegramBotRunner:
     # ---------- 视频中转（采集号 → bot → 目标群） ----------
     @staticmethod
     def _is_video_message(message: dict) -> bool:
+        """Bot API 侧的「这是不是视频」，口径要和 forwarder.detect_video 一致。
+
+        Bot API 会把 video 表情放在 `sticker`、GIF 放在 `animation`，
+        两者都不算视频 —— 采集侧已经排除了，这里必须同步，
+        否则又会“采集侧转了、bot 丢掉”。
+        """
+        if message.get("sticker") or message.get("animation"):
+            return False
         if message.get("video") or message.get("video_note"):
             return True
         doc = message.get("document") or {}
@@ -1284,6 +1292,8 @@ class TelegramBotRunner:
         target = forwarder.load_relay_target(self.store)
         chat_id = int(target.get("chat_id") or 0)
         if not self._is_video_message(message):
+            if message.get("sticker") or message.get("animation"):
+                log.debug("Bot 跳过表情/GIF，不转发 msg=%s", message.get("message_id"))
             return False
         if not chat_id:
             # 最常见的“日志说转了、群里却没有”：目标没绑，或者被直连/解除绑定清了

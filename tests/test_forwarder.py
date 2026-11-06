@@ -15,16 +15,26 @@ from app.store import Store
 
 
 class FakeDoc:
-    def __init__(self, mime: str):
+    def __init__(self, mime: str, attributes=None):
         self.mime_type = mime
+        self.attributes = attributes or []
 
 
 class FakeMessage:
-    def __init__(self, mid: int, *, grouped=None, video=False, mime: str = ""):
+    def __init__(self, mid: int, *, grouped=None, video=False, mime: str = "",
+                 sticker=False, gif=False, video_note=False, photo=False,
+                 attributes=None):
         self.id = mid
         self.grouped_id = grouped
         self.video = object() if video else None
-        self.document = FakeDoc(mime) if mime else None
+        self.video_note = object() if video_note else None
+        self.sticker = object() if sticker else None
+        self.gif = object() if gif else None
+        self.photo = object() if photo else None
+        doc = None
+        if mime:
+            doc = FakeDoc(mime, attributes)
+        self.document = doc
 
 
 class FakeClient:
@@ -76,9 +86,49 @@ TARGET = {
 def test_detect_video():
     assert forwarder.detect_video(FakeMessage(1, video=True)) is True
     assert forwarder.detect_video(FakeMessage(1, mime="video/mp4")) is True
+    assert forwarder.detect_video(FakeMessage(1, video_note=True)) is True
     # 图片、纯文本不算
     assert forwarder.detect_video(FakeMessage(1, mime="image/jpeg")) is False
     assert forwarder.detect_video(FakeMessage(1)) is False
+
+
+def test_video_sticker_is_not_a_video():
+    """video 表情同时带 Sticker + Video 属性，Telethon 的 .video 也会返回真 ——
+    必须优先按表情排掉，否则真的会把表情当视频转走。"""
+    sticker = FakeMessage(1, video=True, sticker=True, mime="video/webm")
+    assert forwarder.detect_video(sticker) is False
+    assert forwarder.media_kind(sticker) == "表情"
+
+
+def test_gif_is_not_a_video():
+    gif = FakeMessage(1, gif=True, mime="video/mp4")
+    assert forwarder.detect_video(gif) is False
+    assert forwarder.media_kind(gif) == "GIF"
+
+
+def test_document_with_sticker_attribute_is_not_a_video():
+    """document 里带 Sticker/Animated 属性的 video mime 也要排掉。"""
+    fake = FakeMessage(1, mime="video/webm", attributes=[
+        type("DocumentAttributeSticker", (), {})(),
+    ])
+    assert forwarder.detect_video(fake) is False
+
+
+def test_bot_and_collector_agree_on_what_is_a_video():
+    """两边口径不一致就会出现「采集侧转了、bot 丢掉」。"""
+    from app.telegram_bot import TelegramBotRunner
+
+    is_video = TelegramBotRunner._is_video_message
+    # 表情：采集侧说是表情，bot 侧看到的是 sticker
+    assert forwarder.detect_video(FakeMessage(1, video=True, sticker=True)) is False
+    assert is_video({"sticker": {"is_video": True}}) is False
+    # GIF：两边都不算
+    assert forwarder.detect_video(FakeMessage(1, gif=True, mime="video/mp4")) is False
+    assert is_video({"animation": {"file_id": "x"}}) is False
+    # 真视频：两边都算
+    assert forwarder.detect_video(FakeMessage(1, video=True)) is True
+    assert is_video({"video": {"file_id": "x"}}) is True
+    assert is_video({"document": {"mime_type": "video/mp4"}}) is True
 
 
 # ---------- 相册 ----------
