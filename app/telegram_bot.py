@@ -49,6 +49,11 @@ ALBUM_WAIT_SECONDS = 2.0
 RELAY_NOTIFY_KEY = "forward.bot.notified_at"
 # 同一种转发错误多久提醒一次，避免几十条视频全失败时刷屏
 RELAY_NOTIFY_SECONDS = 600.0
+# Bot API 对同一个群的硬限制约 20 条/分钟（官方文档）。
+# 主动放慢到每 3.3 秒一条（≈18/分钟），比撞上限后干等 retry_after 更稳。
+COPY_MIN_INTERVAL = 3.3
+# 撞上 429 时的重试次数（每次等 Telegram 说的秒数）
+COPY_RETRY_TIMES = 3
 
 BOT_COMMANDS = (
     {"command": "tasks", "description": "秒传任务 · 可暂停 / 终止 / 重试"},
@@ -220,6 +225,8 @@ class TelegramBotRunner:
         self._album_tasks: dict[str, asyncio.Task] = {}
         # 没配目标群时的提醒限流（不然每条视频都刷一行日志）
         self._relay_warned_at = 0.0
+        # 每个目标群上次发送的时间：用来主动限速（Bot API 约 20 条/分钟/群）
+        self._last_copy_at: dict[int, float] = {}
         # 采集账号的 user_id 缓存（每条私聊都要判一次，不必每次都读库）
         self._senders_cache: set[int] = set()
         self._senders_at = 0.0
@@ -1332,7 +1339,11 @@ class TelegramBotRunner:
                 )
             return True
 
-        await self._copy_videos([msg_id], from_chat, chat_id, conf, client, note)
+        await self._copy_videos(
+            [msg_id], from_chat, chat_id, conf, client, note,
+            # 原文没配文字时，把来源直接写进 caption，省一条消息
+            caption_ok=not str(message.get("caption") or "").strip(),
+        )
         return True
 
     @staticmethod
@@ -1372,34 +1383,73 @@ class TelegramBotRunner:
 
     async def _copy_videos(self, ids: list[int], from_chat: int, to_chat: int,
                           conf: dict, client: httpx.AsyncClient,
-                          note: str = "") -> None:
-        try:
-            if len(ids) > 1:
-                result = await self._api_post(client, conf, "copyMessages", {
-                    "chat_id": int(to_chat),
-                    "from_chat_id": int(from_chat),
-                    "message_ids": list(ids),
-                })
+                          note: str = "", caption_ok: bool = False) -> None:
+        """把视频投到目标群；带主动限速和 429 重试。
+
+          - Bot API 同一个群约 20 条/分钟，这里先自己放慢，不靠撞了再说；
+          - 真撞上 429 就按 Telegram 给的 retry_after 等一下再试，
+            而不是直接丢那条视频。
+        """
+        relay = forwarder.load_relay_target(self.store)
+        use_caption = bool(note) and caption_ok and len(ids) == 1 \
+            and forwarder.link_source_enabled(relay)
+
+        result = None
+        for attempt in range(1, COPY_RETRY_TIMES + 1):
+            await self._wait_copy_slot(to_chat)
+            try:
+                if len(ids) > 1:
+                    result = await self._api_post(client, conf, "copyMessages", {
+                        "chat_id": int(to_chat),
+                        "from_chat_id": int(from_chat),
+                        "message_ids": list(ids),
+                    })
+                else:
+                    payload: dict[str, Any] = {
+                        "chat_id": int(to_chat),
+                        "from_chat_id": int(from_chat),
+                        "message_id": ids[0],
+                    }
+                    if use_caption:
+                        # 塞进 caption 就不必再发一条来源消息，吞吐直接翻倍
+                        payload["caption"] = note
+                    result = await self._api_post(client, conf, "copyMessage", payload)
+            except bot_api.BotApiRateLimit as e:
+                self._last_copy_at[int(to_chat)] = time.time() + e.retry_after
+                log.warning(
+                    "Bot 被限流，等 %.0f 秒后重试（第 %s/%s 次）",
+                    e.retry_after, attempt, COPY_RETRY_TIMES,
+                )
+                if attempt >= COPY_RETRY_TIMES:
+                    detail = f"Bot API 限流，重试 {COPY_RETRY_TIMES} 次仍未成功：{e}"
+                    forwarder.note_relay_result(self.store, ok=False, error=detail[:300])
+                    await self._notify_relay_error(detail, conf, client)
+                    return
+                continue
+            except Exception as e:
+                detail = bot_api._friendly(str(e).replace(conf["token"], "***"))[:300]
+                forwarder.note_relay_result(self.store, ok=False, error=detail)
+                log.warning("Bot 转发视频到群失败：%s", detail)
+                await self._notify_relay_error(detail, conf, client)
+                return
             else:
-                result = await self._api_post(client, conf, "copyMessage", {
-                    "chat_id": int(to_chat),
-                    "from_chat_id": int(from_chat),
-                    "message_id": ids[0],
-                })
-        except Exception as e:
-            # 把 Telegram 的英文报错翻成「该去做什么」：提示不好看，用户就只能逐行看日志
-            detail = bot_api._friendly(str(e).replace(conf["token"], "***"))[:300]
-            forwarder.note_relay_result(self.store, ok=False, error=detail)
-            log.warning("Bot 转发视频到群失败：%s", detail)
-            await self._notify_relay_error(detail, conf, client)
-            return
+                self._last_copy_at[int(to_chat)] = time.time()
+                break
 
         stats = forwarder.note_relay_result(self.store, ok=True, count=len(ids))
         log.info(
             "Bot 已投递 %s 条到群 %s（累计 %s 条，失败 %s 次）",
             len(ids), to_chat, stats.get("copied"), stats.get("failed"),
         )
-        await self._send_source_note(result, to_chat, note, conf, client)
+        if not use_caption:
+            await self._send_source_note(result, to_chat, note, conf, client)
+
+    async def _wait_copy_slot(self, to_chat: int) -> None:
+        """按每群最短间隔排队，主动避开 429。"""
+        last = float(self._last_copy_at.get(int(to_chat)) or 0)
+        wait = last + COPY_MIN_INTERVAL - time.time()
+        if wait > 0:
+            await asyncio.sleep(min(wait, 60.0))
 
     async def _send_source_note(self, result, to_chat: int, note: str,
                                 conf: dict, client: httpx.AsyncClient) -> None:
@@ -1423,6 +1473,9 @@ class TelegramBotRunner:
                 "reply_to_message_id": head[0],
                 "disable_web_page_preview": True,
             })
+        except bot_api.BotApiRateLimit as e:
+            # 来源只是辅助信息，撞限流就不补了，不能因为它拖住后面的视频
+            log.warning("附带来源被限流，先跳过（%.0f 秒）", e.retry_after)
         except Exception as e:
             # 来源没发出去不算转发失败，媒体已经在群里了
             log.warning("Bot 附带来源失败：%s", str(e)[:200])

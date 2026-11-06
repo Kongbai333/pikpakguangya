@@ -442,6 +442,9 @@ def load_relay_stats(store) -> dict:
 def note_relay_result(store, *, ok: bool, error: str = "", count: int = 0) -> dict:
     """bot 侧复制消息的统计（和采集号转发那一步分开算）。"""
     data = load_relay_stats(store)
+    # 两个计数器始终存在：页面直接读，少一个会让前端显示成 undefined
+    data["copied"] = int(data.get("copied") or 0)
+    data["failed"] = int(data.get("failed") or 0)
     if ok:
         data["copied"] = int(data.get("copied") or 0) + max(1, int(count or 1))
         data["last_error"] = ""

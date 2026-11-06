@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
@@ -13,6 +14,8 @@ import httpx
 from app.proxy import ProxyConfig
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
+
+_RETRY_RE = re.compile(r"retry after (\d+)", re.I)
 
 # Bot API 的报错是英文短句，直接甩给用户看不懂；这里翻成「该去做什么」
 _HINTS = (
@@ -30,6 +33,27 @@ _HINTS = (
 
 class BotApiError(RuntimeError):
     """Bot API 调用失败，message 已经是人话。"""
+
+
+class BotApiRateLimit(BotApiError):
+    """被限流（HTTP 429），retry_after 是 Telegram 要求的等待秒数。"""
+
+    def __init__(self, message: str, retry_after: float) -> None:
+        super().__init__(message)
+        self.retry_after = max(1.0, float(retry_after or 0))
+
+
+def _retry_after(description: str, payload: dict | None = None) -> float:
+    """从 “Too Many Requests: retry after 12” 或 parameters 里取秒数。"""
+    params = (payload or {}).get("parameters") or {}
+    try:
+        seconds = float(params.get("retry_after") or 0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds > 0:
+        return seconds
+    match = _RETRY_RE.search(description or "")
+    return float(match.group(1)) if match else 5.0
 
 
 def _friendly(description: str) -> str:
@@ -63,7 +87,14 @@ async def call(token: str, method: str, payload: dict | None = None, *,
     except ValueError:
         raise BotApiError(f"Bot API 返回的不是 JSON（HTTP {response.status_code}）") from None
     if not data.get("ok"):
-        raise BotApiError(_friendly(str(data.get("description") or "")))
+        description = str(data.get("description") or "")
+        # 429 要单独拿出来：调用方得等 retry_after 再重试，而不是当成普通失败
+        if data.get("error_code") == 429 or "too many requests" in description.lower():
+            raise BotApiRateLimit(
+                f"Bot API 限流：{description[:120]}",
+                _retry_after(description, data),
+            )
+        raise BotApiError(_friendly(description))
     return data.get("result")
 
 

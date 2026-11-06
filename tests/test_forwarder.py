@@ -9,7 +9,7 @@ import asyncio
 
 import pytest
 
-from app import forwarder
+from app import bot_api, forwarder
 from app.parser import CodeMerger
 from app.store import Store
 
@@ -684,7 +684,7 @@ def test_bot_relay_copies_single_video(store):
 
 
 def test_bot_relay_sends_source_link_as_reply(store):
-    """copyMessage 会把「转发自」去掉，所以要补一条带链接的回复。"""
+    """原文有文字时用回复补来源（不覆盖原 caption）。"""
     forwarder.save_relay_target(store, chat_id=-100777, title="目标群")
     bot = _make_bot(store)
     sent: list[tuple[str, dict]] = []
@@ -701,6 +701,7 @@ def test_bot_relay_sends_source_link_as_reply(store):
         "message_id": 5,
         "chat": {"id": 42, "type": "private"},
         "video": {"file_id": "x"},
+        "caption": "群里原来的文案",
         "forward_from_chat": {"id": -1004306704719, "title": "搬运群", "username": ""},
         "forward_from_message_id": 456,
     }
@@ -711,6 +712,101 @@ def test_bot_relay_sends_source_link_as_reply(store):
     assert "来源：搬运群" in note["text"]
     assert "https://t.me/c/4306704719/456" in note["text"]
     assert note["reply_to_message_id"] == 4242      # 回复在刚投递的那条下面
+
+
+def test_bot_relay_puts_source_in_caption_when_no_original_text(store):
+    """原文没文字：来源塞进 caption，只发一条消息（吞吐翻倍）。"""
+    forwarder.save_relay_target(store, chat_id=-100777, title="目标群")
+    bot = _make_bot(store)
+    sent: list[tuple[str, dict]] = []
+
+    async def fake_api_post(client, conf, method, payload):
+        sent.append((method, payload))
+        return {"message_id": 1}
+
+    bot._api_post = fake_api_post
+    conf = {"token": "1:abc", "user_id": 42}
+    message = {
+        "message_id": 5,
+        "chat": {"id": 42, "type": "private"},
+        "video": {"file_id": "x"},
+        "forward_from_chat": {"id": -1004306704719, "title": "搬运群"},
+        "forward_from_message_id": 456,
+    }
+    asyncio.run(bot._relay_video(message, conf, None))
+
+    assert [m for m, _ in sent] == ["copyMessage"]      # 没有额外的 sendMessage
+    payload = sent[0][1]
+    assert "来源：搬运群" in payload["caption"]
+    assert "https://t.me/c/4306704719/456" in payload["caption"]
+
+
+def test_bot_retries_after_rate_limit(store, monkeypatch):
+    """撞上 429 要等 retry_after 再试，而不是把这条视频丢掉。"""
+    from app import telegram_bot as tgb
+
+    monkeypatch.setattr(tgb, "COPY_MIN_INTERVAL", 0)
+    forwarder.save_relay_target(store, chat_id=-100777, title="目标群")
+    bot = _make_bot(store)
+    sent: list[tuple[str, dict]] = []
+    waits: list[float] = []
+
+    async def fake_api_post(client, conf, method, payload):
+        sent.append((method, payload))
+        if len(sent) == 1:
+            raise bot_api.BotApiRateLimit("Too Many Requests", 0)
+        return {"message_id": 7}
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+
+    bot._api_post = fake_api_post
+    monkeypatch.setattr(tgb.asyncio, "sleep", fake_sleep)
+    conf = {"token": "1:abc", "user_id": 42}
+    message = {
+        "message_id": 5,
+        "chat": {"id": 42, "type": "private"},
+        "video": {"file_id": "x"},
+    }
+    asyncio.run(bot._relay_video(message, conf, None))
+
+    assert [m for m, _ in sent] == ["copyMessage", "copyMessage"]
+    stats = forwarder.load_relay_stats(store)
+    assert stats["copied"] == 1
+    assert stats["failed"] == 0
+    assert waits           # 确实等过
+
+
+def test_bot_gives_up_after_repeated_rate_limit(store, monkeypatch):
+    from app import telegram_bot as tgb
+
+    monkeypatch.setattr(tgb, "COPY_MIN_INTERVAL", 0)
+    monkeypatch.setattr(tgb, "COPY_RETRY_TIMES", 2)
+    forwarder.save_relay_target(store, chat_id=-100777, title="目标群")
+    bot = _make_bot(store)
+
+    async def fake_api_post(client, conf, method, payload):
+        raise bot_api.BotApiRateLimit("Too Many Requests", 0)
+
+    async def fake_sleep(seconds):
+        return None
+
+    async def fake_send(*args, **kwargs):
+        return 1
+
+    bot._api_post = fake_api_post
+    bot._send_message = fake_send
+    monkeypatch.setattr(tgb.asyncio, "sleep", fake_sleep)
+    conf = {"token": "1:abc", "user_id": 42}
+    message = {
+        "message_id": 5,
+        "chat": {"id": 42, "type": "private"},
+        "video": {"file_id": "x"},
+    }
+    asyncio.run(bot._relay_video(message, conf, None))
+    stats = forwarder.load_relay_stats(store)
+    assert stats["failed"] == 1
+    assert "限流" in stats["last_error"]
 
 
 def test_bot_relay_skips_note_when_disabled(store):
