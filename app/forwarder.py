@@ -49,7 +49,7 @@ def load_target(store, account_id: int) -> dict:
 def save_target(store, account_id: int, *, chat_id: int, raw_id: int,
                 access_hash: int | None, title: str, kind: str = "megagroup",
                 mode: str = "direct", bot_username: str = "",
-                bot_user_id: int = 0) -> dict:
+                bot_user_id: int = 0, link_source: bool = True) -> dict:
     """记下转发目标。
 
     存 `access_hash` 是因为采集用的是另一条长连接（独立 client），
@@ -68,6 +68,7 @@ def save_target(store, account_id: int, *, chat_id: int, raw_id: int,
         "mode": "bot" if mode == "bot" else "direct",
         "bot_username": bot_username or "",
         "bot_user_id": int(bot_user_id or 0),
+        "link_source": bool(link_source),
         "created_at": iso(utcnow()),
     }
     store.set_json(target_key(account_id), data)
@@ -140,6 +141,42 @@ def detect_video(message: Any) -> bool:
         ):
             return False
     return True
+
+
+def message_link(chat_id: int, username: str, message_id: int) -> str:
+    """指向 Telegram 里某条消息的链接。
+
+    超级群/频道用 t.me/c/<内部 id>/<msg>（需要是成员才能打开）；
+    公开频道用 t.me/<username>/<msg>。普通群没有可分享链接，返回空。
+    """
+    mid = int(message_id or 0)
+    if not mid:
+        return ""
+    name = str(username or "").strip().lstrip("@")
+    if name:
+        return f"https://t.me/{name}/{mid}"
+    cid = str(int(chat_id or 0))
+    if cid.startswith("-100"):
+        return f"https://t.me/c/{cid[4:]}/{mid}"
+    return ""
+
+
+def source_text(title: str, link: str) -> str:
+    """跟一条在视频下面的「来源」文本。没有链接时只给群名。"""
+    name = " ".join(str(title or "").split())[:80]
+    link = str(link or "").strip()
+    if name and link:
+        return f"来源：{name}\n{link}"
+    if link:
+        return f"来源：{link}"
+    if name:
+        return f"来源：{name}"
+    return ""
+
+
+def link_source_enabled(target: dict) -> bool:
+    """默认开：附带来源是排查和回原帖的主要手段，只有手动关掉才不发。"""
+    return bool((target or {}).get("link_source", True))
 
 
 def is_recent(value: Any, minutes: int) -> bool:
@@ -219,6 +256,14 @@ def bot_chat_id(peer: dict) -> int:
     return chat_id
 
 
+def _chat_title(chat: Any) -> str:
+    for attr in ("title", "username", "first_name"):
+        value = getattr(chat, attr, None)
+        if value:
+            return str(value)
+    return ""
+
+
 def _target_entity(target: dict):
     """用 raw_id + access_hash 拼一个 InputPeer。
 
@@ -261,7 +306,7 @@ async def forward_message(client, chat, message, target: dict, *,
     try:
         # 注意参数名：client 层是 messages=（Request 层才是 message_ids），
         # 相册多传一个 as_album，转过去仍然是一条相册
-        await client.forward_messages(
+        sent = await client.forward_messages(
             entity=entity,
             messages=ids,
             from_peer=chat,
@@ -269,6 +314,27 @@ async def forward_message(client, chat, message, target: dict, *,
         )
     except Exception as e:
         return {"ok": False, "error": _describe(e), "count": 0}
+
+    # 转发不包含「原消息在哪」的信息（私群尤其看不出），补一条可点的来源回复
+    if link_source_enabled(target):
+        posted = [int(getattr(m, "id", 0) or 0) for m in (sent or [])]
+        head = posted[0] if posted else ids[0]
+        note = source_text(
+            _chat_title(chat),
+            message_link(
+                int(getattr(chat, "id", 0) or 0),
+                getattr(chat, "username", "") or "",
+                ids[0],
+            ),
+        )
+        if note and head:
+            try:
+                await client.send_message(
+                    entity=entity, message=note, reply_to=head,
+                )
+            except Exception as e:
+                # 来源发不出去不算转发失败，媒体已经在群里了
+                log.warning("附带来源消息发送失败：%s", str(e)[:160])
 
     if grouped and forwarded_albums is not None:
         forwarded_albums.add(grouped)
@@ -341,8 +407,13 @@ def load_relay_target(store) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def save_relay_target(store, *, chat_id: int, title: str = "") -> dict:
-    data = {"chat_id": int(chat_id), "title": title or ""}
+def save_relay_target(store, *, chat_id: int, title: str = "",
+                      link_source: bool = True) -> dict:
+    data = {
+        "chat_id": int(chat_id),
+        "title": title or "",
+        "link_source": bool(link_source),
+    }
     store.set_json(RELAY_TARGET_KEY, data)
     return data
 

@@ -37,6 +37,11 @@ class FakeMessage:
         self.document = doc
 
 
+class FakeSent:
+    def __init__(self, mid: int):
+        self.id = mid
+
+
 class FakeClient:
     """参数签名必须和 Telethon 真实方法一致（entity / messages / from_peer / as_album）。
 
@@ -49,6 +54,7 @@ class FakeClient:
         self.error = error
         self.get_calls: list[list[int]] = []
         self.forwards: list[dict] = []
+        self.messages: list[dict] = []
 
     async def get_messages(self, chat, ids=None):
         self.get_calls.append(list(ids or []))
@@ -64,7 +70,11 @@ class FakeClient:
             "from_peer": from_peer,
             **kwargs,
         })
-        return []
+        return [FakeSent(mid) for mid in (messages or [])]
+
+    async def send_message(self, entity=None, message=None, reply_to=None, **kwargs):
+        self.messages.append({"entity": entity, "text": message, "reply_to": reply_to})
+        return FakeSent(999)
 
 
 @pytest.fixture()
@@ -306,6 +316,65 @@ def test_seen_counter_is_separate_from_forwarded(store):
     assert stats["seen"] == 2
     assert stats["forwarded"] == 1
     assert stats["failed"] == 0
+
+
+# ---------- 附带来源链接 ----------
+def test_message_link_forms():
+    # 超级群/频道：用内部 id
+    assert forwarder.message_link(-1004306704719, "", 456) == "https://t.me/c/4306704719/456"
+    # 公开频道：用 username
+    assert forwarder.message_link(-1001, "mychannel", 7) == "https://t.me/mychannel/7"
+    # 普通群没可分享链接
+    assert forwarder.message_link(-987654, "", 7) == ""
+    assert forwarder.message_link(-1004306704719, "", 0) == ""
+
+
+def test_source_text_variants():
+    assert forwarder.source_text("搬运群", "https://t.me/c/1/2") == (
+        "来源：搬运群\nhttps://t.me/c/1/2"
+    )
+    assert forwarder.source_text("", "https://t.me/c/1/2") == "来源：https://t.me/c/1/2"
+    assert forwarder.source_text("搬运群", "") == "来源：搬运群"
+    assert forwarder.source_text("", "") == ""
+
+
+def test_link_source_defaults_on_and_can_be_turned_off():
+    assert forwarder.link_source_enabled({}) is True
+    assert forwarder.link_source_enabled({"link_source": True}) is True
+    assert forwarder.link_source_enabled({"link_source": False}) is False
+
+
+def test_direct_forward_replies_with_source_link():
+    class _Chat:
+        id = -1004306704719
+        username = ""
+        title = "搬运群"
+
+    client = FakeClient()
+    target = dict(TARGET, kind="channel", link_source=True)
+    asyncio.run(forwarder.forward_message(
+        client, _Chat(), FakeMessage(456, video=True), target,
+    ))
+    assert client.forwards[0]["ids"] == [456]
+    assert len(client.messages) == 1
+    note = client.messages[0]
+    assert "来源：搬运群" in note["text"]
+    assert "https://t.me/c/4306704719/456" in note["text"]
+    assert note["reply_to"] == 456          # 回复到刚转过去的那条
+
+
+def test_direct_forward_skips_note_when_disabled():
+    class _Chat:
+        id = -1004306704719
+        username = ""
+        title = "搬运群"
+
+    client = FakeClient()
+    asyncio.run(forwarder.forward_message(
+        client, _Chat(), FakeMessage(456, video=True),
+        dict(TARGET, kind="channel", link_source=False),
+    ))
+    assert client.messages == []
 
 
 def test_is_recent_window():
@@ -612,6 +681,60 @@ def test_bot_relay_copies_single_video(store):
     assert sent[0][1]["chat_id"] == -100777
     assert sent[0][1]["from_chat_id"] == 42
     assert forwarder.load_relay_stats(store)["copied"] == 1
+
+
+def test_bot_relay_sends_source_link_as_reply(store):
+    """copyMessage 会把「转发自」去掉，所以要补一条带链接的回复。"""
+    forwarder.save_relay_target(store, chat_id=-100777, title="目标群")
+    bot = _make_bot(store)
+    sent: list[tuple[str, dict]] = []
+
+    async def fake_api_post(client, conf, method, payload):
+        sent.append((method, payload))
+        if method == "copyMessage":
+            return {"message_id": 4242}
+        return {}
+
+    bot._api_post = fake_api_post
+    conf = {"token": "1:abc", "user_id": 42}
+    message = {
+        "message_id": 5,
+        "chat": {"id": 42, "type": "private"},
+        "video": {"file_id": "x"},
+        "forward_from_chat": {"id": -1004306704719, "title": "搬运群", "username": ""},
+        "forward_from_message_id": 456,
+    }
+    asyncio.run(bot._relay_video(message, conf, None))
+
+    assert [m for m, _ in sent] == ["copyMessage", "sendMessage"]
+    note = sent[1][1]
+    assert "来源：搬运群" in note["text"]
+    assert "https://t.me/c/4306704719/456" in note["text"]
+    assert note["reply_to_message_id"] == 4242      # 回复在刚投递的那条下面
+
+
+def test_bot_relay_skips_note_when_disabled(store):
+    forwarder.save_relay_target(
+        store, chat_id=-100777, title="目标群", link_source=False,
+    )
+    bot = _make_bot(store)
+    sent: list[tuple[str, dict]] = []
+
+    async def fake_api_post(client, conf, method, payload):
+        sent.append((method, payload))
+        return {"message_id": 1}
+
+    bot._api_post = fake_api_post
+    conf = {"token": "1:abc", "user_id": 42}
+    message = {
+        "message_id": 5,
+        "chat": {"id": 42, "type": "private"},
+        "video": {"file_id": "x"},
+        "forward_from_chat": {"id": -1004306704719, "title": "搬运群"},
+        "forward_from_message_id": 456,
+    }
+    asyncio.run(bot._relay_video(message, conf, None))
+    assert [m for m, _ in sent] == ["copyMessage"]
 
 
 def test_bot_ignores_messages_when_no_relay_target(store):

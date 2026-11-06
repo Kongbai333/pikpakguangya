@@ -1317,6 +1317,7 @@ class TelegramBotRunner:
             return False
 
         group = str(message.get("media_group_id") or "")
+        note = self._source_note(message)
         log.info(
             "Bot 收到待转发视频 msg=%s from=%s album=%s → 群 %s",
             msg_id, from_chat, group or "-", chat_id,
@@ -1327,32 +1328,60 @@ class TelegramBotRunner:
             task = self._album_tasks.get(group)
             if task is None or task.done():
                 self._album_tasks[group] = asyncio.create_task(
-                    self._flush_album(group, from_chat, chat_id, conf, client)
+                    self._flush_album(group, from_chat, chat_id, conf, client, note)
                 )
             return True
 
-        await self._copy_videos([msg_id], from_chat, chat_id, conf, client)
+        await self._copy_videos([msg_id], from_chat, chat_id, conf, client, note)
         return True
 
+    @staticmethod
+    def _source_note(message: dict) -> str:
+        """从 Bot API 的转发信息里拼出「来源」，带可点链接。
+
+        copyMessage 会把「转发自」那行头信息去掉，所以目标群里看不到来源。
+        这里从 forward_origin / forward_from_chat 里取原群和消息 id，
+        单发一条回复把链接附上，点一下就能回到原帖。
+        """
+        origin = message.get("forward_origin") or {}
+        chat = message.get("forward_from_chat") or (origin.get("chat") or {})
+        chat_id = int(chat.get("id") or 0)
+        title = str(chat.get("title") or "")
+        msg_id = int(
+            message.get("forward_from_message_id") or origin.get("message_id") or 0
+        )
+        if not chat_id:
+            sender = message.get("forward_from") or (origin.get("sender_user") or {})
+            name = " ".join(
+                x for x in [sender.get("first_name"), sender.get("last_name")] if x
+            ) or str(sender.get("username") or "")
+            return forwarder.source_text(name, "")
+        link = forwarder.message_link(
+            chat_id, str(chat.get("username") or ""), msg_id,
+        )
+        return forwarder.source_text(title, link)
+
     async def _flush_album(self, group: str, from_chat: int, to_chat: int,
-                           conf: dict, client: httpx.AsyncClient) -> None:
+                           conf: dict, client: httpx.AsyncClient,
+                           note: str = "") -> None:
         await asyncio.sleep(ALBUM_WAIT_SECONDS)
         ids = sorted(self._album_pending.pop(group, []))
         self._album_tasks.pop(group, None)
         if ids:
-            await self._copy_videos(ids, from_chat, to_chat, conf, client)
+            await self._copy_videos(ids, from_chat, to_chat, conf, client, note)
 
     async def _copy_videos(self, ids: list[int], from_chat: int, to_chat: int,
-                          conf: dict, client: httpx.AsyncClient) -> None:
+                          conf: dict, client: httpx.AsyncClient,
+                          note: str = "") -> None:
         try:
             if len(ids) > 1:
-                await self._api_post(client, conf, "copyMessages", {
+                result = await self._api_post(client, conf, "copyMessages", {
                     "chat_id": int(to_chat),
                     "from_chat_id": int(from_chat),
                     "message_ids": list(ids),
                 })
             else:
-                await self._api_post(client, conf, "copyMessage", {
+                result = await self._api_post(client, conf, "copyMessage", {
                     "chat_id": int(to_chat),
                     "from_chat_id": int(from_chat),
                     "message_id": ids[0],
@@ -1363,12 +1392,40 @@ class TelegramBotRunner:
             forwarder.note_relay_result(self.store, ok=False, error=detail)
             log.warning("Bot 转发视频到群失败：%s", detail)
             await self._notify_relay_error(detail, conf, client)
-        else:
-            stats = forwarder.note_relay_result(self.store, ok=True, count=len(ids))
-            log.info(
-                "Bot 已投递 %s 条到群 %s（累计 %s 条，失败 %s 次）",
-                len(ids), to_chat, stats.get("copied"), stats.get("failed"),
-            )
+            return
+
+        stats = forwarder.note_relay_result(self.store, ok=True, count=len(ids))
+        log.info(
+            "Bot 已投递 %s 条到群 %s（累计 %s 条，失败 %s 次）",
+            len(ids), to_chat, stats.get("copied"), stats.get("failed"),
+        )
+        await self._send_source_note(result, to_chat, note, conf, client)
+
+    async def _send_source_note(self, result, to_chat: int, note: str,
+                                conf: dict, client: httpx.AsyncClient) -> None:
+        """把「来源 + 原消息链接」作为回复发在刚投递的视频下面。"""
+        target = forwarder.load_relay_target(self.store)
+        if not note or not forwarder.link_source_enabled(target):
+            return
+        rows = result if isinstance(result, list) else [result]
+        head: list[int] = []
+        for row in rows or []:
+            if isinstance(row, dict):
+                mid = int(row.get("message_id") or 0)
+                if mid:
+                    head.append(mid)
+        if not head:
+            return
+        try:
+            await self._api_post(client, conf, "sendMessage", {
+                "chat_id": int(to_chat),
+                "text": note,
+                "reply_to_message_id": head[0],
+                "disable_web_page_preview": True,
+            })
+        except Exception as e:
+            # 来源没发出去不算转发失败，媒体已经在群里了
+            log.warning("Bot 附带来源失败：%s", str(e)[:200])
 
     async def _notify_relay_error(self, detail: str, conf: dict,
                                   client: httpx.AsyncClient) -> None:

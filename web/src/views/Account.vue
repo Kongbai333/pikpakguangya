@@ -295,6 +295,22 @@ async function inviteBotToChat() {
   }
 }
 
+/** 开关「附带来源链接」：不用重绑，直接改现有目标。 */
+async function toggleLinkSource(enabled) {
+  if (!selected.value) return
+  try {
+    const data = await api.post('/api/forward/link-source', {
+      account_id: selected.value.id,
+      enabled,
+    })
+    forward.target = data.target || {}
+    forward.relay = data.relay || forward.relay
+    message.success(enabled ? '已在视频下面附带来源链接' : '不再附带来源链接')
+  } catch (e) {
+    message.error(e.message)
+  }
+}
+
 async function bindForwardTarget() {
   if (!selected.value || !forwardPick.value) return
   forwardBusy.value = 'bind'
@@ -303,6 +319,7 @@ async function bindForwardTarget() {
       account_id: selected.value.id,
       chat_id: forwardPick.value,
       mode: forwardMode.value,
+      link_source: forward.target.link_source !== false,
     })
     forward.target = data.target || {}
     forward.stats = data.stats || {}
@@ -839,6 +856,15 @@ usePolling(load, 10000)
             <n-radio-button value="direct">直连（采集号发到群）</n-radio-button>
             <n-radio-button value="bot">经 Bot（bot 发到群）</n-radio-button>
           </n-radio-group>
+          <n-checkbox
+            v-if="forward.target.chat_id"
+            class="mt-1.5"
+            size="small"
+            :checked="forward.target.link_source !== false"
+            @update:checked="toggleLinkSource"
+          >
+            附带来源链接（在视频下面回复一条 t.me 链接，点一下回到原帖）
+          </n-checkbox>
           <div v-if="forwardDiag" class="mt-2 rounded-md bg-[var(--app-panel-2)] px-2.5 py-2">
             <div class="text-[12px] mb-1" :class="forwardDiag.ok ? 'text-[var(--app-ok)]' : 'text-[var(--app-danger)]'">
               {{ forwardDiag.ok ? '各项检查都通过' : '有项目没通过，看下面带 ✗ 的那几行' }}

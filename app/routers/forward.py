@@ -26,6 +26,13 @@ class ForwardTargetIn(BaseModel):
     account_id: int | None = None
     # direct = 采集号直接发到群；bot = 采集号发给 bot，由 bot 发到群
     mode: str = "direct"
+    # 是否在视频下面跟一条「来源 + 原消息链接」
+    link_source: bool = True
+
+
+class ForwardLinkSourceIn(BaseModel):
+    account_id: int | None = None
+    enabled: bool = True
 
 
 def build_router(ctx: WebContext) -> APIRouter:
@@ -144,8 +151,12 @@ def build_router(ctx: WebContext) -> APIRouter:
                 mode="bot",
                 bot_username=str(me.get("username") or ""),
                 bot_user_id=int(me.get("id") or 0),
+                link_source=body.link_source,
             )
-            forwarder.save_relay_target(store, chat_id=bot_chat, title=title)
+            forwarder.save_relay_target(
+                store, chat_id=bot_chat, title=title,
+                link_source=body.link_source,
+            )
             return snapshot(body.account_id)
 
         # 直连：从 Telethon 那边取 raw_id / access_hash
@@ -160,6 +171,7 @@ def build_router(ctx: WebContext) -> APIRouter:
             title=peer.get("title") or "",
             kind=peer.get("kind") or "channel",
             mode="direct",
+            link_source=body.link_source,
         )
         forwarder.clear_relay_target(store)
         return snapshot(body.account_id)
@@ -356,6 +368,22 @@ def build_router(ctx: WebContext) -> APIRouter:
             "stats": forwarder.load_stats(store, aid),
             "relay_stats": forwarder.load_relay_stats(store),
         }
+
+    @router.post("/api/forward/link-source")
+    def api_forward_link_source(body: ForwardLinkSourceIn) -> dict:
+        """开关「附带来源链接」。不用重新绑定，直接改现有目标。"""
+        account = account_of(body.account_id) or {}
+        aid = int(account.get("id") or 0)
+        target = forwarder.load_target(store, aid)
+        if not target.get("chat_id"):
+            raise HTTPException(status_code=400, detail="还没有转发目标")
+        target["link_source"] = bool(body.enabled)
+        store.set_json(forwarder.target_key(aid), target)
+        relay = forwarder.load_relay_target(store)
+        if relay.get("chat_id"):
+            relay["link_source"] = bool(body.enabled)
+            store.set_json(forwarder.RELAY_TARGET_KEY, relay)
+        return snapshot(body.account_id)
 
     @router.post("/api/forward/toggle")
     def api_forward_toggle(body: ForwardToggleIn) -> dict:
