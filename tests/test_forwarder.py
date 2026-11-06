@@ -297,6 +297,32 @@ def test_target_round_trip(store):
     assert forwarder.load_target(store, 1) == {}
 
 
+def test_seen_counter_is_separate_from_forwarded(store):
+    """seen 和 forwarded/failed 对账：差额就是「看到了但没转出去」。"""
+    forwarder.note_seen(store, 1)
+    forwarder.note_seen(store, 1)
+    forwarder.note_result(store, 1, ok=True, source="群A", count=1)
+    stats = forwarder.load_stats(store, 1)
+    assert stats["seen"] == 2
+    assert stats["forwarded"] == 1
+    assert stats["failed"] == 0
+
+
+def test_is_recent_window():
+    """补偿回溯补转只看最近 N 分钟，避免重启时把历史灌进目标群。"""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    assert forwarder.is_recent(now, 60) is True
+    assert forwarder.is_recent(now - timedelta(minutes=5), 60) is True
+    assert forwarder.is_recent(now - timedelta(hours=3), 60) is False
+    # 没有时间、或者不是 datetime：当旧处理
+    assert forwarder.is_recent(None, 60) is False
+    assert forwarder.is_recent("2026-01-01", 60) is False
+    # 无时区的时间按 UTC 算（Telethon 正常会给带时区的）
+    assert forwarder.is_recent(now.replace(tzinfo=None), 60) is True
+
+
 def test_stats_accumulate_and_keep_last_error(store):
     forwarder.note_result(store, 1, ok=True, source="群A", count=2)
     forwarder.note_result(store, 1, ok=False, error="boom", source="群B")

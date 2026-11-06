@@ -242,7 +242,8 @@ async def _resolve_chats(client, watch: list[str]) -> tuple[list[Any], list[str]
 
 
 async def _backfill(client, store: Store, merger: CodeMerger, cfg, chats: list[Any],
-                    account_id: int, *, catch_up: bool = False, skip=None) -> int:
+                    account_id: int, *, catch_up: bool = False, skip=None,
+                    on_message=None) -> int:
     """补齐「上次采集位置」到现在的消息，不读监控之前的历史。
 
     - 这个账号第一次监控某个群（没有游标）：不读历史，把游标推到当前最新，
@@ -305,6 +306,10 @@ async def _backfill(client, store: Store, merger: CodeMerger, cfg, chats: list[A
                     continue
                 await _ingest(msg, chat, store, merger, cfg, account_id)
                 n += 1
+                if on_message is not None:
+                    # 补偿回溯可以在这里补转视频（只转最近的，见 collector）
+                    with contextlib.suppress(Exception):
+                        await on_message(msg, chat)
             batch_max = max(int(getattr(m, "id", 0) or 0) for m in batch)
             if batch_max <= max_id:
                 break

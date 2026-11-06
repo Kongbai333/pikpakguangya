@@ -268,6 +268,48 @@ def test_backfill_skips_already_handled_messages(store):
     assert store.stats()["shares"] == 1        # 没有重复落库
 
 
+def test_backfill_runs_on_message_hook(store):
+    """补偿回溯支持把补到的消息交给回调 —— 采集侧靠它补转视频。"""
+    merger = CodeMerger(90)
+    chat = _FakeChat(-1003739604004, "搬运家")
+    msgs = [_FakeMsg(f"https://mypikpak.com/s/EXAMPLEShareId00000000000{i}", mid=7 + i)
+            for i in range(3)]
+    client = _FakeIterClient({chat.id: msgs})
+    store.set_state(listener.cursor_key(1, chat.id), "6")
+
+    seen: list[int] = []
+
+    async def hook(msg, c):
+        seen.append(msg.id)
+
+    n = asyncio.run(listener._backfill(
+        client, store, merger, _cfg(store), [chat], 1, catch_up=True,
+        on_message=hook,
+    ))
+    assert n == 3
+    assert seen == [7, 8, 9]          # 每条补到的消息都过了一次回调
+
+
+def test_backfill_on_message_error_does_not_break_ingest(store):
+    """回调抛异常不能把回溯带崩（否则采集就停了）。"""
+    merger = CodeMerger(90)
+    chat = _FakeChat(-1003739604004, "搬运家")
+    msgs = [_FakeMsg(f"https://mypikpak.com/s/EXAMPLEShareId00000000000{i}", mid=7 + i)
+            for i in range(2)]
+    client = _FakeIterClient({chat.id: msgs})
+    store.set_state(listener.cursor_key(1, chat.id), "6")
+
+    async def hook(msg, c):
+        raise RuntimeError("boom")
+
+    n = asyncio.run(listener._backfill(
+        client, store, merger, _cfg(store), [chat], 1, catch_up=True,
+        on_message=hook,
+    ))
+    assert n == 2
+    assert store.stats()["shares"] == 2      # 入库照旧
+
+
 def test_catchup_does_not_jump_the_cursor_when_backfill_limit_is_zero(store):
     """backfill_limit=0 是「跳过历史」的意思，不能用在补偿上。
 

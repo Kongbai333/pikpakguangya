@@ -279,6 +279,12 @@ class TelegramBotRunner:
 
     async def stop(self) -> None:
         self._stop.set()
+        # 先把待发相册补发掉，再停轮询：不停掉轮询的话拿不到 conf，
+        # 但补发用的是独立的 Bot API 调用，不依赖那个轮询连接
+        try:
+            await self._flush_pending_albums(resolve_bot_settings(self.store))
+        except Exception as e:
+            log.warning("Bot 停止前补发相册时出错：%s", str(e)[:200])
         if self.transfer_manager is not None:
             self.transfer_manager.set_progress_callback(None)
         tasks = [self._task, self._event_task]
@@ -1377,6 +1383,40 @@ class TelegramBotRunner:
                 client, conf, int(conf["user_id"]),
                 "⚠️ 视频转发失败：" + html.escape(detail[:200]),
             )
+
+    async def _flush_pending_albums(self, conf: dict) -> int:
+        """停止前把还没发出去的相册发掉。
+
+        相册要等 2 秒凑齐，正好在这 2 秒里重启，内存里的待发列表就没了。
+        重启不常有，但那是真实存在的一个「漏一条」窗口，收一下。
+        （不能用 asyncio.run：这里已经在事件循环里了）
+        """
+        pending, self._album_pending = self._album_pending, {}
+        for task in self._album_tasks.values():
+            task.cancel()
+        self._album_tasks.clear()
+        if not pending:
+            return 0
+        target = forwarder.load_relay_target(self.store)
+        to_chat = int(target.get("chat_id") or 0)
+        token = str(conf.get("token") or "")
+        if not to_chat or not token:
+            return 0
+        sent = 0
+        for ids in pending.values():
+            try:
+                await bot_api.copy_messages(
+                    token, to_chat, int(conf["user_id"]), ids,
+                )
+            except Exception as e:
+                log.warning("Bot 停止前补发相册失败：%s", str(e)[:200])
+                forwarder.note_relay_result(self.store, ok=False, error=str(e)[:200])
+            else:
+                sent += len(ids)
+                forwarder.note_relay_result(self.store, ok=True, count=len(ids))
+        if sent:
+            log.info("Bot 停止前补发了 %s 条相册消息", sent)
+        return sent
 
     async def _handle_callback(self, callback: dict, conf: dict,
                                client: httpx.AsyncClient) -> None:

@@ -42,6 +42,8 @@ CATCHUP_SECONDS = 120
 DONE_IDS_PER_CHAT = 2000
 # 看门狗巡检间隔：账号开着采集开关但任务没在跑时自动拉起
 WATCHDOG_SECONDS = 60
+# 补偿回溯补转视频的时间窗（分钟）：只补这么新的，避免重启时刷爆目标群
+MISSED_FORWARD_WINDOW_MINUTES = 60
 # 看门狗重启失败后的退避上限（秒）
 WATCHDOG_MAX_BACKOFF = 600
 # 单条消息处理失败时的重试次数（DB 被占用这类瞬时错误能扛过去）
@@ -260,13 +262,19 @@ class Collector:
                 return
 
     async def _forward_once(self, client, event, forwarded_albums: set[int]) -> None:
-        """监控群里的新视频 → 转进自己建的转发群组。
-
-        只处理实时新消息：回溯历史不转发，否则一启动就把整个历史刷进目标群。
-        转发失败不影响采集本身 —— 拿不到的东西记下来，别把整条处理链路拖垮。
-        """
+        """实时新消息里的视频 → 转进目标群。"""
         chat = getattr(event, "chat", None)
         msg = getattr(event, "message", None)
+        await self._forward_media(client, chat, msg, forwarded_albums)
+
+    async def _forward_media(self, client, chat, msg, forwarded_albums: set[int]) -> None:
+        """把一条（可能是相册的）视频转发出去。
+
+        实时链路和补偿回溯都走这里：实时链路保不准会漏（handler 抛异常、
+        Telegram 少推一条 update、连接抖一下），回溯时把最近的补转一次，
+        避免出现「预览里有、目标群里没有」。
+        转发失败不影响采集本身 —— 拿不到的东西记下来，别把整条链路拖垮。
+        """
         chat_id = int(getattr(chat, "id", 0) or 0)
         if not chat_id or msg is None:
             return
@@ -284,6 +292,9 @@ class Collector:
                     chat_id, getattr(msg, "id", 0), kind,
                 )
             return
+
+        # 先记「看到了一条视频」，和 forwarded/failed 对账用
+        forwarder.note_seen(self.store, self.account_id)
 
         try:
             if str(target.get("mode") or "direct") == "bot":
@@ -323,7 +334,8 @@ class Collector:
         else:
             self._note(f"转发视频失败：{result.get('error') or '未知原因'}")
 
-    async def _catchup(self, client, chats: list[Any], merger: CodeMerger) -> None:
+    async def _catchup(self, client, chats: list[Any], merger: CodeMerger,
+                       forwarded_albums: set[int]) -> None:
         """运行中定期按游标重扫，把实时链路漏掉的补回来。
 
         实时链路没有游标：handler 抛异常、Telegram 少推一条 update、
@@ -341,6 +353,9 @@ class Collector:
                 n = await L._backfill(
                     client, self.store, merger, self.cfg, chats, self.account_id,
                     catch_up=True, skip=self._already_done,
+                    on_message=lambda msg, chat: self._forward_recent(
+                        client, chat, msg, forwarded_albums
+                    ),
                 )
             except asyncio.CancelledError:
                 raise
@@ -350,6 +365,18 @@ class Collector:
             if n:
                 self._note(f"补偿回溯补齐 {n} 条（实时链路漏了）")
                 log.warning("账号 %s 补偿回溯补齐 %s 条消息", self.account_id, n)
+
+    async def _forward_recent(self, client, chat, msg, forwarded_albums: set[int]) -> None:
+        """补偿回溯里的补转：只补最近 MISSED_FORWARD_WINDOW 分钟内的。
+
+        为什么限时间：重启时的回溯会把几天的历史全扫一遍，不按时间卡住
+        就会一次性把历史视频灌进目标群（刷爆 + 被限流）。
+        实时链路真正漏掉的通常是刚刚那一两条。
+        """
+        date = getattr(msg, "date", None)
+        if not forwarder.is_recent(date, MISSED_FORWARD_WINDOW_MINUTES):
+            return
+        await self._forward_media(client, chat, msg, forwarded_albums)
 
     async def _run(self, client, chats: list[Any], origin: str) -> None:
         from telethon import events
@@ -396,7 +423,9 @@ class Collector:
             self._note("回溯完成，等新消息")
             log.info("账号 %s 采集已启动：%s 个群（%s）", account_id, len(chats), origin)
             # 首次回溯跑完再开补偿，两边都动游标，错开就不用担心互相覆盖
-            catchup_task = asyncio.create_task(self._catchup(client, chats, merger))
+            catchup_task = asyncio.create_task(
+                self._catchup(client, chats, merger, forwarded_albums)
+            )
             await self._stop.wait()
         except asyncio.CancelledError:
             raise

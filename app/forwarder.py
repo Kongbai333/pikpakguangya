@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.store import iso, utcnow
@@ -139,6 +140,18 @@ def detect_video(message: Any) -> bool:
         ):
             return False
     return True
+
+
+def is_recent(value: Any, minutes: int) -> bool:
+    """消息发布时间是否在最近 minutes 分钟内。
+
+    补偿回溯补转视频时用它卡时间窗：不卡的话重启会把几天历史灌进目标群。
+    拿不到时间一律当「旧」，宁可少转也不刷爆目标群。
+    """
+    if not isinstance(value, datetime):
+        return False
+    posted = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return utcnow() - posted <= timedelta(minutes=max(1, int(minutes or 0)))
 
 
 def media_kind(message: Any) -> str:
@@ -336,6 +349,18 @@ def save_relay_target(store, *, chat_id: int, title: str = "") -> dict:
 
 def clear_relay_target(store) -> None:
     store.set_json(RELAY_TARGET_KEY, {})
+
+
+def note_seen(store, account_id: int) -> dict:
+    """记下「看到了一条该转的视频」。
+
+    和 forwarded / failed 对账用的：seen 比 forwarded + failed 大，
+    就说明有东西没转出去 —— 至少能看出来，而不是靠拍脑袋。
+    """
+    data = load_stats(store, account_id)
+    data["seen"] = int(data.get("seen") or 0) + 1
+    store.set_json(stats_key(account_id), data)
+    return data
 
 
 def load_relay_stats(store) -> dict:

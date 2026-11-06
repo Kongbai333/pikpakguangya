@@ -817,7 +817,8 @@ usePolling(load, 10000)
           <div class="text-[12.5px] muted mt-1.5">
             打开下表的「转发」开关后，新视频会实时转进这个群；只转发新消息，不从历史开始刷。
             <span v-if="forward.stats.forwarded || forward.stats.failed">
-              采集号转发 {{ forward.stats.forwarded || 0 }} 组 ·
+              收到视频 {{ forward.stats.seen || 0 }} 条 ·
+              交给 bot {{ forward.stats.forwarded || 0 }} 次 ·
               失败 {{ forward.stats.failed || 0 }} 次
             </span>
             <span v-if="forward.stats.last_at">· 最近 {{ fmtTime(forward.stats.last_at) }}</span>
