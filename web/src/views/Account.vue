@@ -37,10 +37,14 @@ const chatsLoading = ref(false)
 
 /* ---------- 视频转发 ---------- */
 const forwardBusy = ref('')
+const forwardCandidates = ref([])
+const forwardPick = ref(null)
+const forwardMode = ref('direct')
 const forward = reactive({
   account_id: 0,
   target: {},
   stats: {},
+  relay: { chat: {}, stats: {}, token_set: false },
   chats: [],
 })
 
@@ -196,6 +200,8 @@ async function loadForward() {
     forward.account_id = data.account_id || 0
     forward.target = data.target || {}
     forward.stats = data.stats || {}
+    forward.relay = data.relay || { chat: {}, stats: {}, token_set: false }
+    forwardMode.value = forward.target.mode || 'direct'
   } catch (e) {
     message.error(e.message)
   }
@@ -243,6 +249,59 @@ async function clearForwardGroup() {
       }
     },
   })
+}
+
+/** 账号被限制建群（spamreported）时的出路：绑一个已有的超级群/频道。 */
+async function loadForwardCandidates() {
+  if (!selected.value) return
+  forwardBusy.value = 'candidates'
+  try {
+    const data = await api.get('/api/forward/candidates', {
+      account_id: selected.value.id,
+    })
+    forwardCandidates.value = data.chats || []
+    if (!forwardCandidates.value.length) {
+      message.warning('这个账号没有可用作转发目标的超级群/频道（普通群不列，升级后 id 会变）')
+    }
+  } catch (e) {
+    message.error(e.message)
+  } finally {
+    forwardBusy.value = ''
+  }
+}
+
+async function bindForwardTarget() {
+  if (!selected.value || !forwardPick.value) return
+  forwardBusy.value = 'bind'
+  try {
+    const data = await api.post('/api/forward/target', {
+      account_id: selected.value.id,
+      chat_id: forwardPick.value,
+      mode: forwardMode.value,
+    })
+    forward.target = data.target || {}
+    forward.stats = data.stats || {}
+    forward.relay = data.relay || forward.relay
+    message.success(`已绑定转发目标：${forward.target.title || ''}`)
+  } catch (e) {
+    message.error(e.message)
+  } finally {
+    forwardBusy.value = ''
+  }
+}
+
+/** 让 bot 往目标群发一条测试消息，确认权限真的够。 */
+async function testForwardChannel() {
+  if (!selected.value) return
+  forwardBusy.value = 'test'
+  try {
+    await api.post(`/api/forward/test?account_id=${selected.value.id}`, {})
+    message.success('bot 已经往目标群发了一条消息，去群里看看')
+  } catch (e) {
+    message.error(e.message)
+  } finally {
+    forwardBusy.value = ''
+  }
 }
 
 function chatStat(row) {
@@ -715,10 +774,67 @@ usePolling(load, 10000)
           <div class="text-[12.5px] muted mt-1.5">
             打开下表的「转发」开关后，新视频会实时转进这个群；只转发新消息，不从历史开始刷。
             <span v-if="forward.stats.forwarded || forward.stats.failed">
-              已转发 {{ forward.stats.forwarded || 0 }} 组 ·
+              采集号转发 {{ forward.stats.forwarded || 0 }} 组 ·
               失败 {{ forward.stats.failed || 0 }} 次
             </span>
             <span v-if="forward.stats.last_at">· 最近 {{ fmtTime(forward.stats.last_at) }}</span>
+          </div>
+          <div
+            v-if="forward.relay.stats.copied || forward.relay.stats.failed"
+            class="text-[12.5px] muted mt-0.5"
+          >
+            Bot 已投递 {{ forward.relay.stats.copied || 0 }} 条 ·
+            失败 {{ forward.relay.stats.failed || 0 }} 次
+            <span v-if="forward.relay.stats.last_at">· 最近 {{ fmtTime(forward.relay.stats.last_at) }}</span>
+          </div>
+          <div v-if="forward.relay.stats.last_error" class="text-[12px] text-[var(--app-danger)] mt-1">
+            {{ forward.relay.stats.last_error }}
+          </div>
+
+          <n-radio-group v-model:value="forwardMode" class="mt-2" size="small">
+            <n-radio-button value="direct">直连（采集号发到群）</n-radio-button>
+            <n-radio-button value="bot">经 Bot（bot 发到群）</n-radio-button>
+          </n-radio-group>
+          <div v-if="forwardMode === 'bot'" class="text-[12px] muted mt-1.5">
+            采集号只把视频转发给 bot（不往群里刷大文件，降低采集号被风控的风险），
+            再由 bot 发到群里。要求：Bot Token 已填、采集号给 bot 发过 <code>/start</code>、
+            bot 已在目标群里且有发言权限。
+            <span v-if="forward.target.mode === 'bot' && forward.target.bot_username">
+              当前 bot：@{{ forward.target.bot_username }}
+            </span>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 mt-2">
+            <n-select
+              v-model:value="forwardPick"
+              class="w-[300px]"
+              size="small"
+              filterable
+              clearable
+              :options="forwardCandidates.map((c) => ({ label: `${c.title} · ${c.kind}`, value: c.chat_id }))"
+              placeholder="已有超级群 / 频道"
+              :loading="forwardBusy === 'candidates'"
+              @focus="loadForwardCandidates"
+            />
+            <n-button
+              size="tiny"
+              :disabled="!forwardPick"
+              :loading="forwardBusy === 'bind'"
+              @click="bindForwardTarget"
+            >
+              绑定为目标
+            </n-button>
+            <n-button
+              v-if="forward.target.mode === 'bot'"
+              size="tiny"
+              tertiary
+              :loading="forwardBusy === 'test'"
+              @click="testForwardChannel"
+            >
+              发测试消息
+            </n-button>
+            <span class="text-[12px] muted">
+              账号被限制建群（spamreported）时，绑一个已有的超级群/频道也能转发
+            </span>
           </div>
           <div v-if="forward.stats.last_error" class="text-[12px] text-[var(--app-danger)] mt-1">
             {{ forward.stats.last_error }}

@@ -145,10 +145,20 @@ def _friendly(e: Exception) -> str:
         return "登录态已失效，需要重新登录"
     if isinstance(e, E.ChatForbiddenError):
         return "没有权限：这个群开了「禁止转发」或你不在里面"
+    if isinstance(e, E.ForbiddenError) and "banned" in str(e).lower():
+        return "账号被 Telegram 封禁，无法执行这个操作"
     text = str(e)
+    lowered = text.lower()
+    # 不管抛的是 UserRestrictedError 还是普通错误，看到这句话就按账号受限解释
+    if "spamreported" in lowered:
+        return (
+            "这个账号被 Telegram 判定为 spamreported（被举报限制了），不能新建群/频道。"
+            "给 @SpamBot 发 /start 可以看原因和能否申诉（临时限制可能自动解除）；"
+            "急用的话改用「绑定已有群组」当转发目标。"
+        )
     if "CHANNELS_TOO_MUCH" in text or "TOO_MUCH" in text:
         return "这个账号建的群/频道太多了，Telegram 限制了，换账号或先删掉一些"
-    if "not enough rights" in text.lower():
+    if "not enough rights" in lowered:
         return "权限不足：需要在这个群里发消息的权限"
     return f"{type(e).__name__}: {e}"
 
@@ -518,6 +528,66 @@ class TelegramSession:
             "access_hash": int(getattr(chat, "access_hash", 0) or 0),
             "title": getattr(chat, "title", "") or name,
             "kind": "megagroup",
+        }
+
+    async def list_forward_candidates(self) -> list[dict]:
+        """可以当转发目标的群组：超级群，或有发帖权限的频道。
+
+        普通群不列：超过 200 人 Telegram 会强制升级成超级群，**id 会变**，
+        存下来的目标就废了。广播频道也只有管理员能发，没权限的不列。
+        """
+        client = await self.require_authorized()
+        out: list[dict] = []
+        try:
+            async for dialog in client.iter_dialogs():
+                entity = dialog.entity
+                if not (dialog.is_group or dialog.is_channel):
+                    continue
+                broadcast = bool(getattr(entity, "broadcast", False))
+                megagroup = bool(getattr(entity, "megagroup", False))
+                if not (broadcast or megagroup):
+                    continue
+                rights = getattr(entity, "admin_rights", None)
+                can_post = (
+                    not broadcast
+                    or bool(getattr(entity, "creator", False))
+                    or bool(getattr(rights, "post_messages", False))
+                )
+                if not can_post:
+                    continue
+                out.append({
+                    "chat_id": int(f"-100{int(entity.id)}"),
+                    "title": dialog.name or "",
+                    "kind": "频道" if broadcast else "超级群",
+                })
+        except Exception as e:
+            raise LoginError(_friendly(e)) from e
+        out.sort(key=lambda row: row["title"])
+        return out
+
+    async def forward_target_peer(self, chat_id: int) -> dict:
+        """把已有的群/频道绑成转发目标，顺便取出 access_hash。
+
+        账号被限制建群时，这是唯一能用的路子。
+        """
+        client = await self.require_authorized()
+        try:
+            entity = await client.get_entity(int(chat_id))
+        except Exception as e:
+            raise LoginError(_friendly(e)) from e
+        raw_id = int(getattr(entity, "id", 0) or 0)
+        if not raw_id:
+            raise LoginError("拿不到这个群组的 id")
+        is_channel = bool(
+            getattr(entity, "megagroup", False) or getattr(entity, "broadcast", False)
+        )
+        return {
+            "raw_id": raw_id,
+            "chat_id": int(f"-100{raw_id}") if is_channel else raw_id,
+            "access_hash": int(getattr(entity, "access_hash", 0) or 0),
+            "title": getattr(entity, "title", "") or "",
+            # 频道/超级群走 InputPeerChannel，基本群走 InputPeerChat
+            "kind": "channel" if is_channel else "chat",
         }
 
     async def leave(self, chat_id: int) -> dict:

@@ -262,6 +262,32 @@ MTProto 代理说的是 MTProto 协议，代理不了 PikPak 的 HTTPS 请求，
 用法：「账号监控」页 → 选中账号 → 「视频转发」卡片里点「创建转发群组」（用这个账号
 建一个只有自己的超级群），再把下面群组表里要转的群的「转发」开关打开。
 
+**账号被限制建群怎么办**：Telegram 对“被举报过”的账号会限制新建群/频道，报
+`UserRestrictedError: You're spamreported`。这种账号其实仍能用转发 —— 卡片里的下拉框
+可以绑一个**已有的超级群/频道**当目标（只列超级群和频道，普通群不列：超过 200 人会被
+强制升级、id 会变）。限制本身可以给 @SpamBot 发 `/start` 查看原因、临时限制会自己解除。
+
+### 两种转发模式
+
+| 模式 | 链路 | 适用 |
+|---|---|---|
+| **直连** | 采集号 → 目标群 | 采集号在群里且有发言权；最快，限制最宽松 |
+| **经 Bot** | 采集号 → bot 私聊 → bot 发到群 | 采集号不宜往群里刷大文件；目标群只要 bot 有权就行 |
+
+bot 模式的准备（三件缺一不可）：
+
+1. 设置页填 **Bot Token**（@BotFather `/newbot` 拿，这步必须手动做）。
+2. 把 bot 拉进目标群：超级群当普通成员即可；群若设了“仅管理员发言”或目标是个
+   频道，就把 bot 设为管理员（频道需要 `post_messages`）。
+3. **采集号先给 bot 发一次 `/start`** —— bot 不能主动给陌生人发消息，没 start 过就收不到。
+
+绑定时会先用 Bot API `getChat` 确认 bot 真的在那个群，否则当场报错，不会等转了
+才发现。卡片上还有「发测试消息」，让 bot 往群里发一条，直接验证发言权限。
+
+代价：Bot API 对**单个群约 20 条/分钟**限流，视频量大时会落后于直连；
+相册用 `copyMessages` 一次发完（否则会散成几条）。bot 侧复制失败会写进卡片上的
+统计和原因，同时在 Bot 里提一次（同一种错误 10 分钟内只提一次，不刷屏）。
+
 几个刻意的行为，不是 bug：
 
 - **只转新消息**。回溯历史和补偿回溯都不转发 —— 否则一启动就会把整个历史刷进目标群。
@@ -417,7 +443,10 @@ GET    /api/web-public               前台浏览页开关状态
 PUT    /api/web-public               打开 / 关闭前台浏览页
 
 GET    /api/forward                  转发目标群 + 统计 + 各群开关
-POST   /api/forward/group            创建转发群组并绑成目标
+GET    /api/forward/candidates       可当目标的已有超级群 / 频道
+POST   /api/forward/group            创建转发群组并绑成目标（直连）
+POST   /api/forward/target           绑一个已有的群/频道（mode=direct|bot）
+POST   /api/forward/test             bot 往目标群发一条测试消息
 DELETE /api/forward/group            解除绑定（群本身留在 Telegram）
 POST   /api/forward/toggle           开关某个群的视频转发
 

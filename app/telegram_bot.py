@@ -18,6 +18,8 @@ from typing import Any, Callable
 
 import httpx
 
+from app import bot_api
+from app import forwarder
 from app import transfer as transfer_module
 from app import integrations as integrations_module
 from app.guangya_login import GuangyaAuth
@@ -40,6 +42,13 @@ PROGRESS_MAX_SECONDS = 5.0
 PROGRESS_TICK_SECONDS = 1.0
 BOT_TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
 BOT_URL_RE = re.compile(r"(https://api\.telegram\.org/bot)[^/\s\"']+", re.I)
+
+# 视频中转：相册等多久再一次性 copyMessages（Telegram 会在几百毫秒内把
+# 同一个 media_group_id 的消息都推完，等 2 秒足够）
+ALBUM_WAIT_SECONDS = 2.0
+RELAY_NOTIFY_KEY = "forward.bot.notified_at"
+# 同一种转发错误多久提醒一次，避免几十条视频全失败时刷屏
+RELAY_NOTIFY_SECONDS = 600.0
 
 BOT_COMMANDS = (
     {"command": "tasks", "description": "秒传任务 · 可暂停 / 终止 / 重试"},
@@ -206,6 +215,9 @@ class TelegramBotRunner:
         self._search_sessions: dict[str, dict] = {}
         self._suppressed_jobs: set[int] = set()
         self._pending_account_actions: dict[int, dict] = {}
+        # 视频中转：相册要等同一个 media_group_id 的消息到齐再一次性 copyMessages
+        self._album_pending: dict[str, list[int]] = {}
+        self._album_tasks: dict[str, asyncio.Task] = {}
 
     def status(self) -> dict:
         conf = resolve_bot_settings(self.store)
@@ -1117,6 +1129,9 @@ class TelegramBotRunner:
             return
 
         text = message.get("text")
+        if await self._relay_video(message, conf, client):
+            # 采集号转发过来的视频：转进目标群就行，不用再当命令/链接处理
+            return
         if not isinstance(text, str) or not text.strip():
             return
 
@@ -1217,6 +1232,91 @@ class TelegramBotRunner:
                     await self._send_message(
                         client, conf, sender_id, f"加入秒传队列失败：{detail}"
                     )
+
+    # ---------- 视频中转（采集号 → bot → 目标群） ----------
+    @staticmethod
+    def _is_video_message(message: dict) -> bool:
+        if message.get("video") or message.get("video_note"):
+            return True
+        doc = message.get("document") or {}
+        return str(doc.get("mime_type") or "").startswith("video/")
+
+    async def _relay_video(self, message: dict, conf: dict,
+                           client: httpx.AsyncClient) -> bool:
+        """采集号转发过来的视频 → 复制到目标群。返回 True 表示这条已经处理。
+
+        采号只负责把视频丢进 bot 私聊，真正往群里发的是 bot：
+        Bot API 的配额和用户账号的风控是两套东西，不容易连坐采集号。
+        """
+        target = forwarder.load_relay_target(self.store)
+        chat_id = int(target.get("chat_id") or 0)
+        if not chat_id or not self._is_video_message(message):
+            return False
+        msg_id = int(message.get("message_id") or 0)
+        from_chat = int((message.get("chat") or {}).get("id") or 0)
+        if not msg_id or not from_chat:
+            return False
+
+        group = str(message.get("media_group_id") or "")
+        if group:
+            # 相册：等同一个 media_group_id 的消息齐了再 copyMessages
+            self._album_pending.setdefault(group, []).append(msg_id)
+            task = self._album_tasks.get(group)
+            if task is None or task.done():
+                self._album_tasks[group] = asyncio.create_task(
+                    self._flush_album(group, from_chat, chat_id, conf, client)
+                )
+            return True
+
+        await self._copy_videos([msg_id], from_chat, chat_id, conf, client)
+        return True
+
+    async def _flush_album(self, group: str, from_chat: int, to_chat: int,
+                           conf: dict, client: httpx.AsyncClient) -> None:
+        await asyncio.sleep(ALBUM_WAIT_SECONDS)
+        ids = sorted(self._album_pending.pop(group, []))
+        self._album_tasks.pop(group, None)
+        if ids:
+            await self._copy_videos(ids, from_chat, to_chat, conf, client)
+
+    async def _copy_videos(self, ids: list[int], from_chat: int, to_chat: int,
+                          conf: dict, client: httpx.AsyncClient) -> None:
+        try:
+            if len(ids) > 1:
+                await self._api_post(client, conf, "copyMessages", {
+                    "chat_id": int(to_chat),
+                    "from_chat_id": int(from_chat),
+                    "message_ids": list(ids),
+                })
+            else:
+                await self._api_post(client, conf, "copyMessage", {
+                    "chat_id": int(to_chat),
+                    "from_chat_id": int(from_chat),
+                    "message_id": ids[0],
+                })
+        except Exception as e:
+            # 把 Telegram 的英文报错翻成「该去做什么」：提示不好看，用户就只能逐行看日志
+            detail = bot_api._friendly(str(e).replace(conf["token"], "***"))[:300]
+            forwarder.note_relay_result(self.store, ok=False, error=detail)
+            log.warning("Bot 转发视频到群失败：%s", detail)
+            await self._notify_relay_error(detail, conf, client)
+        else:
+            forwarder.note_relay_result(self.store, ok=True, count=len(ids))
+            log.info("Bot 已把 %s 条视频复制到群 %s", len(ids), to_chat)
+
+    async def _notify_relay_error(self, detail: str, conf: dict,
+                                  client: httpx.AsyncClient) -> None:
+        """转发失败提一条；同一种错误 10 分钟内只提一次，别刷屏。"""
+        state = self.store.get_json(RELAY_NOTIFY_KEY, {}) or {}
+        now = time.time()
+        if now - float(state.get("at") or 0) < RELAY_NOTIFY_SECONDS:
+            return
+        self.store.set_json(RELAY_NOTIFY_KEY, {"at": now, "detail": detail})
+        with contextlib.suppress(Exception):
+            await self._send_message(
+                client, conf, int(conf["user_id"]),
+                "⚠️ 视频转发失败：" + html.escape(detail[:200]),
+            )
 
     async def _handle_callback(self, callback: dict, conf: dict,
                                client: httpx.AsyncClient) -> None:

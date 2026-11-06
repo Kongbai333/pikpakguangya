@@ -378,3 +378,26 @@ def test_forward_toggle_and_snapshot(client):
         if c["chat_id"] == -100777
     )
     assert row["forward_enabled"] is False
+
+
+def test_forward_bot_mode_requires_token(client):
+    """bot 中转要先有 Token，否则应该直接报清楚，而不是绑定完才失败。"""
+    store = client.app.state.store
+    store.add_watched(-100888, title="目标群", enabled=True)
+    res = client.post("/api/forward/target", json={"chat_id": -100888, "mode": "bot"})
+    assert res.status_code == 400
+    assert "Bot Token" in res.json()["detail"]
+
+
+def test_forward_snapshot_has_relay_section(client):
+    data = client.get("/api/forward").json()
+    assert "relay" in data
+    assert "token_set" in data["relay"]
+    assert data["relay"]["chat"] == {}
+
+
+def test_forward_test_endpoint_rejects_direct_mode(client):
+    """直连模式没有 bot 可测，应该直说。"""
+    res = client.post("/api/forward/test")
+    assert res.status_code == 400
+    assert "bot 中转" in res.json()["detail"]

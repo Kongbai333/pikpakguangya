@@ -279,9 +279,15 @@ class Collector:
             return
 
         try:
-            result = await forwarder.forward_message(
-                client, chat, msg, target, forwarded_albums=forwarded_albums,
-            )
+            if str(target.get("mode") or "direct") == "bot":
+                # 经 bot 中转：采集号只负责把视频丢给 bot 私聊
+                result = await forwarder.forward_to_bot(
+                    client, chat, msg, target, forwarded_albums=forwarded_albums,
+                )
+            else:
+                result = await forwarder.forward_message(
+                    client, chat, msg, target, forwarded_albums=forwarded_albums,
+                )
         except Exception as e:      # 兜底：别把事件循环带崩
             result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         if result.get("skipped") == "album":
@@ -298,6 +304,7 @@ class Collector:
             self._note(
                 f"已转发 {result.get('count') or 1} 条视频 → "
                 f"{target.get('title') or '转发群'}"
+                + ("（经 bot）" if str(target.get("mode")) == "bot" else "")
             )
         else:
             self._note(f"转发视频失败：{result.get('error') or '未知原因'}")
