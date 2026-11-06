@@ -626,6 +626,66 @@ class TelegramSession:
             "kind": "channel" if is_channel else "chat",
         }
 
+    async def invite_bot(self, chat_id: int, bot_username: str) -> dict:
+        """把 bot 拉进群／频道（bot 自己做不到这件事）。
+
+        Bot API 根本没有“加群”接口，所以只能由人（或人用的账号）拉。
+        这里用这个账号的 MTProto 会话发邀请，它必须是管理员且有「邀请用户」权限；
+        普通群则要求允许成员拉人。
+        拉完不保证 bot 能发言：频道还需要把 bot 设成管理员（这里不做，权限不够）。
+        """
+        client = await self.require_authorized()
+        name = (bot_username or "").strip().lstrip("@")
+        if not name:
+            raise LoginError("还没配置 Bot Token，不知道要拉哪个 bot")
+
+        from telethon.errors import (
+            ChatAdminRequiredError,
+            UserAlreadyParticipantError,
+        )
+        from telethon.tl.functions.channels import InviteToChannelRequest
+        from telethon.tl.functions.messages import AddChatUserRequest
+
+        try:
+            bot = await client.get_entity("@" + name)
+            target = await client.get_entity(int(chat_id))
+        except Exception as e:
+            raise LoginError(_friendly(e)) from e
+
+        is_channel = bool(
+            getattr(target, "megagroup", False) or getattr(target, "broadcast", False)
+        )
+        try:
+            if is_channel:
+                await client(InviteToChannelRequest(channel=target, users=[bot]))
+            else:
+                await client(AddChatUserRequest(
+                    chat_id=int(getattr(target, "id", 0)),
+                    user_id=int(getattr(bot, "id", 0)),
+                    fwd_limit=0,
+                ))
+        except UserAlreadyParticipantError:
+            return {
+                "invited": True, "already": True,
+                "title": getattr(target, "title", "") or "",
+                "broadcast": bool(getattr(target, "broadcast", False)),
+            }
+        except ChatAdminRequiredError as e:
+            raise LoginError(
+                "这个账号在这个群没有邀请权限：需要管理员 + 「邀请用户」，"
+                "或者手动把 bot 拉进去"
+            ) from e
+        except Exception as e:
+            raise LoginError(_friendly(e)) from e
+
+        return {
+            "invited": True,
+            "already": False,
+            "title": getattr(target, "title", "") or "",
+            # 频道（broadcast）只加进去还不能发，还要把它设成管理员
+            "broadcast": bool(getattr(target, "broadcast", False)),
+        }
+
     async def leave(self, chat_id: int) -> dict:
         client = await self.require_authorized()
         from telethon.tl.functions.channels import LeaveChannelRequest

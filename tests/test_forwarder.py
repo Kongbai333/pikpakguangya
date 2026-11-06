@@ -114,6 +114,58 @@ def test_document_with_sticker_attribute_is_not_a_video():
     assert forwarder.detect_video(fake) is False
 
 
+# ---------- 把 bot 拉进群 ----------
+class FakeInviteClient:
+    """只够 invite_bot 用：解析实体 + 发一个 request。"""
+
+    def __init__(self, target, *, error=None):
+        self.target = target
+        self.error = error
+        self.calls: list[str] = []
+
+    async def get_entity(self, ref):
+        if isinstance(ref, str):
+            return FakeEntity(900, megagroup=False)
+        return self.target
+
+    async def __call__(self, request):
+        if self.error is not None:
+            raise self.error
+        self.calls.append(type(request).__name__)
+        return object()
+
+
+def test_invite_bot_into_supergroup(store):
+    target = FakeEntity(22, megagroup=True, title="超级群")
+    client = FakeInviteClient(target)
+    session = make_session(store, client)
+    result = asyncio.run(session.invite_bot(-10022, "my_bot"))
+    assert result["invited"] is True
+    assert result["already"] is False
+    assert client.calls == ["InviteToChannelRequest"]
+
+
+def test_invite_bot_into_basic_group(store):
+    target = FakeEntity(11, megagroup=False, title="普通群")
+    client = FakeInviteClient(target)
+    session = make_session(store, client)
+    asyncio.run(session.invite_bot(11, "my_bot"))
+    assert client.calls == ["AddChatUserRequest"]
+
+
+def test_invite_bot_without_admin_rights_is_explained(store):
+    from telethon.errors import ChatAdminRequiredError
+
+    from app.tg import LoginError
+
+    target = FakeEntity(22, megagroup=True, title="超级群")
+    client = FakeInviteClient(target, error=ChatAdminRequiredError(None))
+    session = make_session(store, client)
+    with pytest.raises(LoginError) as err:
+        asyncio.run(session.invite_bot(-10022, "my_bot"))
+    assert "邀请权限" in str(err.value)
+
+
 def test_bot_and_collector_agree_on_what_is_a_video():
     """两边口径不一致就会出现「采集侧转了、bot 丢掉」。"""
     from app.telegram_bot import TelegramBotRunner

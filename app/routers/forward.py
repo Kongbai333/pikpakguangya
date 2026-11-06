@@ -164,6 +164,60 @@ def build_router(ctx: WebContext) -> APIRouter:
         forwarder.clear_relay_target(store)
         return snapshot(body.account_id)
 
+    @router.post("/api/forward/invite-bot")
+    async def api_forward_invite_bot(body: ForwardTargetIn) -> dict:
+        """让这个账号把 bot 拉进目标群，并用 Bot API 验证结果。
+
+        bot 自己加不了群（Bot API 没这个接口），所以只能借账号的手。
+        """
+        account = account_of(body.account_id) or {}
+        aid = int(account.get("id") or 0)
+        if not aid:
+            raise HTTPException(status_code=400, detail="还没有可用的 Telegram 账号")
+        bot = resolve_bot_settings(store)
+        token = str(bot.get("token") or "")
+        if not token:
+            raise HTTPException(
+                status_code=400, detail="还没配置 Bot Token（设置 → Telegram Bot）",
+            )
+        try:
+            me = await bot_api.get_me(token, ctx.system_proxy())
+        except bot_api.BotApiError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        username = str(me.get("username") or "")
+
+        result = await ctx.call(
+            ctx.session_for(account).invite_bot(int(body.chat_id), username)
+        )
+
+        # 拉进去之后再问一次 Telegram：真的在里面才算成功
+        verified = False
+        try:
+            await bot_api.get_chat(
+                token, int(body.chat_id), ctx.system_proxy(),
+            )
+        except bot_api.BotApiError as e:
+            return {
+                "status": 200,
+                "invited": bool(result.get("invited")),
+                "verified": False,
+                "detail": f"邀请求发出了，但 bot 现在还看不到这个群：{e}",
+                **result,
+            }
+        verified = True
+
+        detail = "bot 已经在群里"
+        if result.get("broadcast"):
+            detail += "；频道还得把它设成管理员（要有发消息权限），否则发不出去"
+        return {
+            "status": 200,
+            "invited": bool(result.get("invited")),
+            "already": bool(result.get("already")),
+            "verified": verified,
+            "detail": detail,
+            **result,
+        }
+
     @router.post("/api/forward/test")
     async def api_forward_test(account_id: int | None = None) -> dict:
         """让 bot 往目标群发一条测试消息，确认权限真的够。"""

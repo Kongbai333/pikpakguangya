@@ -271,6 +271,30 @@ async function loadForwardCandidates() {
   }
 }
 
+/** 让采集号把 bot 拉进群（bot 自己加不了群）。 */
+async function inviteBotToChat() {
+  if (!selected.value) return
+  const chatId = forwardPick.value || forward.target.chat_id
+  if (!chatId) {
+    message.warning('先在上面选一个群，或者先绑定目标群')
+    return
+  }
+  forwardBusy.value = 'invite'
+  try {
+    const data = await api.post('/api/forward/invite-bot', {
+      account_id: selected.value.id,
+      chat_id: chatId,
+      mode: forwardMode.value,
+    })
+    if (data.verified) message.success(data.detail || 'bot 已经在群里')
+    else message.warning(data.detail || '邀请求发出了，但 bot 还看不到这个群')
+  } catch (e) {
+    message.error(e.message)
+  } finally {
+    forwardBusy.value = ''
+  }
+}
+
 async function bindForwardTarget() {
   if (!selected.value || !forwardPick.value) return
   forwardBusy.value = 'bind'
@@ -859,6 +883,15 @@ usePolling(load, 10000)
               绑定为目标
             </n-button>
             <n-button
+              v-if="forwardMode === 'bot'"
+              size="tiny"
+              tertiary
+              :loading="forwardBusy === 'invite'"
+              @click="inviteBotToChat"
+            >
+              把 bot 拉进群
+            </n-button>
+            <n-button
               size="tiny"
               tertiary
               :loading="forwardBusy === 'diagnose'"
@@ -878,8 +911,7 @@ usePolling(load, 10000)
             <span class="text-[12px] muted">
               账号被限制建群（spamreported）时，绑一个已有群组也能转发；
               普通群也行，但超过 200 人会被升级成超级群、需要重新绑
-            </span>
-          </div>
+            </span>          </div>
           <div v-if="forward.stats.last_error" class="text-[12px] text-[var(--app-danger)] mt-1">
             {{ forward.stats.last_error }}
           </div>
