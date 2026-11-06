@@ -301,11 +301,18 @@ class Collector:
             count=int(result.get("count") or 0),
         )
         if result.get("ok"):
-            self._note(
-                f"已转发 {result.get('count') or 1} 条视频 → "
-                f"{target.get('title') or '转发群'}"
-                + ("（经 bot）" if str(target.get("mode")) == "bot" else "")
-            )
+            count = result.get("count") or 1
+            if str(target.get("mode") or "direct") == "bot":
+                # 说清楚只完成了一半：视频到了 bot，能不能进群看下一跳
+                self._note(
+                    f"已把 {count} 条视频交给 bot"
+                    f"（{target.get('bot_username') or '未命名'}），"
+                    f"等 bot 投递到「{target.get('title') or '目标群'}」"
+                )
+            else:
+                self._note(
+                    f"已转发 {count} 条视频 → {target.get('title') or '转发群'}"
+                )
         else:
             self._note(f"转发视频失败：{result.get('error') or '未知原因'}")
 

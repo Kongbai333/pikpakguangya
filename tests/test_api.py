@@ -401,3 +401,35 @@ def test_forward_test_endpoint_rejects_direct_mode(client):
     res = client.post("/api/forward/test")
     assert res.status_code == 400
     assert "bot 中转" in res.json()["detail"]
+
+
+def test_forward_diagnose_lists_checks_without_network(client):
+    """没配 Bot Token 时诊断也要能跑，且把缺的东西列出来（不连网）。"""
+    data = client.get("/api/forward/diagnose").json()
+    names = {c["name"]: c for c in data["checks"]}
+    assert "转发模式" in names
+    assert "已开转发的源群" in names
+    # 没有目标时应该报出来，而不是静默通过
+    assert data["ok"] is False
+    assert names["已开转发的源群"]["ok"] is False
+
+
+def test_forward_diagnose_flags_bot_mode_gaps(client):
+    """bot 模式但没 Token / 没绑群：诊断必须明确指出。"""
+    store = client.app.state.store
+    account = store.active_account() or {}
+    if not account:
+        pytest.skip("没有当前账号")
+    from app import forwarder
+
+    forwarder.save_target(
+        store, int(account["id"]), chat_id=-100777, raw_id=0, access_hash=0,
+        title="目标群", kind="channel", mode="bot", bot_username="b",
+        bot_user_id=1,
+    )
+    data = client.get("/api/forward/diagnose",
+                      params={"account_id": account["id"]}).json()
+    names = {c["name"]: c for c in data["checks"]}
+    assert names["Bot Token"]["ok"] is False
+    # 没 Token 就不应该去请求 Telegram
+    assert "bot 目标群" in names

@@ -218,6 +218,8 @@ class TelegramBotRunner:
         # 视频中转：相册要等同一个 media_group_id 的消息到齐再一次性 copyMessages
         self._album_pending: dict[str, list[int]] = {}
         self._album_tasks: dict[str, asyncio.Task] = {}
+        # 没配目标群时的提醒限流（不然每条视频都刷一行日志）
+        self._relay_warned_at = 0.0
 
     def status(self) -> dict:
         conf = resolve_bot_settings(self.store)
@@ -1250,7 +1252,17 @@ class TelegramBotRunner:
         """
         target = forwarder.load_relay_target(self.store)
         chat_id = int(target.get("chat_id") or 0)
-        if not chat_id or not self._is_video_message(message):
+        if not self._is_video_message(message):
+            return False
+        if not chat_id:
+            # 最常见的“日志说转了、群里却没有”：目标没绑，或者被直连/解除绑定清了
+            now = time.time()
+            if now - self._relay_warned_at > RELAY_NOTIFY_SECONDS:
+                self._relay_warned_at = now
+                log.warning(
+                    "Bot 收到视频，但没有 bot 转发目标群"
+                    "（去「账号监控 → 视频转发」用 bot 模式绑定一个），这条不会投递"
+                )
             return False
         msg_id = int(message.get("message_id") or 0)
         from_chat = int((message.get("chat") or {}).get("id") or 0)
@@ -1258,6 +1270,10 @@ class TelegramBotRunner:
             return False
 
         group = str(message.get("media_group_id") or "")
+        log.info(
+            "Bot 收到待转发视频 msg=%s from=%s album=%s → 群 %s",
+            msg_id, from_chat, group or "-", chat_id,
+        )
         if group:
             # 相册：等同一个 media_group_id 的消息齐了再 copyMessages
             self._album_pending.setdefault(group, []).append(msg_id)
@@ -1301,8 +1317,11 @@ class TelegramBotRunner:
             log.warning("Bot 转发视频到群失败：%s", detail)
             await self._notify_relay_error(detail, conf, client)
         else:
-            forwarder.note_relay_result(self.store, ok=True, count=len(ids))
-            log.info("Bot 已把 %s 条视频复制到群 %s", len(ids), to_chat)
+            stats = forwarder.note_relay_result(self.store, ok=True, count=len(ids))
+            log.info(
+                "Bot 已投递 %s 条到群 %s（累计 %s 条，失败 %s 次）",
+                len(ids), to_chat, stats.get("copied"), stats.get("failed"),
+            )
 
     async def _notify_relay_error(self, detail: str, conf: dict,
                                   client: httpx.AsyncClient) -> None:

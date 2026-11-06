@@ -40,6 +40,7 @@ const forwardBusy = ref('')
 const forwardCandidates = ref([])
 const forwardPick = ref(null)
 const forwardMode = ref('direct')
+const forwardDiag = ref(null)
 const forward = reactive({
   account_id: 0,
   target: {},
@@ -290,13 +291,27 @@ async function bindForwardTarget() {
   }
 }
 
-/** 让 bot 往目标群发一条测试消息，确认权限真的够。 */
-async function testForwardChannel() {
+/** 让 bot 往目标群发一条测试消息，确认权限真的够。 */async function testForwardChannel() {
   if (!selected.value) return
   forwardBusy.value = 'test'
   try {
     await api.post(`/api/forward/test?account_id=${selected.value.id}`, {})
     message.success('bot 已经往目标群发了一条消息，去群里看看')
+  } catch (e) {
+    message.error(e.message)
+  } finally {
+    forwardBusy.value = ''
+  }
+}
+
+/** 逐项查「日志说转了、群里却没有」到底卡在哪一步。 */
+async function diagnoseForward() {
+  if (!selected.value) return
+  forwardBusy.value = 'diagnose'
+  try {
+    forwardDiag.value = await api.get('/api/forward/diagnose', {
+      account_id: selected.value.id,
+    })
   } catch (e) {
     message.error(e.message)
   } finally {
@@ -795,6 +810,22 @@ usePolling(load, 10000)
             <n-radio-button value="direct">直连（采集号发到群）</n-radio-button>
             <n-radio-button value="bot">经 Bot（bot 发到群）</n-radio-button>
           </n-radio-group>
+          <div v-if="forwardDiag" class="mt-2 rounded-md bg-[var(--app-panel-2)] px-2.5 py-2">
+            <div class="text-[12px] mb-1" :class="forwardDiag.ok ? 'text-[var(--app-ok)]' : 'text-[var(--app-danger)]'">
+              {{ forwardDiag.ok ? '各项检查都通过' : '有项目没通过，看下面带 ✗ 的那几行' }}
+            </div>
+            <div
+              v-for="c in forwardDiag.checks"
+              :key="c.name"
+              class="text-[12px] leading-5"
+            >
+              <span :class="c.ok ? 'text-[var(--app-ok)]' : 'text-[var(--app-danger)]'">
+                {{ c.ok ? '✓' : '✗' }}
+              </span>
+              <span class="font-medium ml-1">{{ c.name }}</span>
+              <span class="muted ml-1">{{ c.detail }}</span>
+            </div>
+          </div>
           <div v-if="forwardMode === 'bot'" class="text-[12px] muted mt-1.5">
             采集号只把视频转发给 bot（不往群里刷大文件，降低采集号被风控的风险），
             再由 bot 发到群里。要求：Bot Token 已填、采集号给 bot 发过 <code>/start</code>、
@@ -822,6 +853,14 @@ usePolling(load, 10000)
               @click="bindForwardTarget"
             >
               绑定为目标
+            </n-button>
+            <n-button
+              size="tiny"
+              tertiary
+              :loading="forwardBusy === 'diagnose'"
+              @click="diagnoseForward"
+            >
+              诊断
             </n-button>
             <n-button
               v-if="forward.target.mode === 'bot'"

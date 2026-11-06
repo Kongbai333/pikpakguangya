@@ -192,6 +192,110 @@ def build_router(ctx: WebContext) -> APIRouter:
         forwarder.clear_relay_target(store)
         return snapshot(account_id)
 
+    @router.get("/api/forward/diagnose")
+    async def api_forward_diagnose(account_id: int | None = None) -> dict:
+        """逐项查「日志说转了、群里却没有」到底卡在哪一步。"""
+        account = account_of(account_id) or {}
+        aid = int(account.get("id") or 0)
+        target = forwarder.load_target(store, aid)
+        relay = forwarder.load_relay_target(store)
+        bot = resolve_bot_settings(store)
+        token = str(bot.get("token") or "")
+        proxy = ctx.system_proxy()
+        checks: list[dict] = []
+
+        def add(name: str, ok: bool, detail: str) -> None:
+            checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+        mode = "bot" if str(target.get("mode") or "direct") == "bot" else "direct"
+        add(
+            "转发模式",
+            True,
+            "经 Bot（采集号 → bot → 群）" if mode == "bot" else "直连（采集号 → 群）",
+        )
+
+        if mode == "bot":
+            add(
+                "bot 目标群",
+                bool(relay.get("chat_id")),
+                f"{relay.get('title') or '未命名'}（chat_id={relay.get('chat_id')}）"
+                if relay.get("chat_id")
+                else "没绑定目标群，bot 收到视频也不会投递",
+            )
+            add("Bot Token", bool(token), "已配置" if token else "没配（设置 → Telegram Bot）")
+            if token:
+                try:
+                    me = await bot_api.get_me(token, proxy)
+                except bot_api.BotApiError as e:
+                    add("bot 身份", False, str(e))
+                else:
+                    add(
+                        "bot 身份", True,
+                        f"@{me.get('username') or '?'}（id={me.get('id')}）",
+                    )
+                    if relay.get("chat_id"):
+                        try:
+                            chat = await bot_api.get_chat(
+                                token, int(relay["chat_id"]), proxy,
+                            )
+                        except bot_api.BotApiError as e:
+                            add("bot 在目标群", False, str(e))
+                        else:
+                            add("bot 在目标群", True, str(chat.get("title") or ""))
+
+            # 最容易出事的一项：采集号不是 bot 配置的那个用户 → bot 直接忽略
+            collector_uid = int(account.get("user_id") or 0)
+            bot_uid = int(bot.get("user_id") or 0)
+            if collector_uid and bot_uid:
+                same = collector_uid == bot_uid
+                add(
+                    "采集号 = bot 接收用户",
+                    same,
+                    "同一个号，转发能被 bot 收到"
+                    if same
+                    else (
+                        f"不一致：采集号 {collector_uid}，Bot 配置的是 {bot_uid}。"
+                        "bot 只认配置的那个用户，其余私聊会被直接忽略"
+                    ),
+                )
+            else:
+                add(
+                    "采集号 = bot 接收用户",
+                    False,
+                    "两边都要有 user_id 才能比对（先在账号页让账号同步一次用户信息）",
+                )
+
+            runner = getattr(ctx.app.state, "telegram_bot", None)
+            status = runner.status() if runner is not None else {}
+            add(
+                "bot 轮询",
+                bool(status.get("running")),
+                "运行中"
+                if status.get("running")
+                else f"没在跑：{status.get('error') or '检查 Bot Token / 是否被 Webhook 占用'}",
+            )
+            if status.get("last_update_at"):
+                add("bot 最近收到消息", True, str(status["last_update_at"]))
+
+        watching = [
+            w for w in store.list_watched(account_id=aid or None)
+            if w.get("forward_enabled")
+        ]
+        add(
+            "已开转发的源群",
+            bool(watching),
+            "、".join(w["title"] or str(w["chat_id"]) for w in watching)
+            or "一个都没打开",
+        )
+
+        return {
+            "status": 200,
+            "ok": all(c["ok"] for c in checks),
+            "checks": checks,
+            "stats": forwarder.load_stats(store, aid),
+            "relay_stats": forwarder.load_relay_stats(store),
+        }
+
     @router.post("/api/forward/toggle")
     def api_forward_toggle(body: ForwardToggleIn) -> dict:
         account = account_of(body.account_id) or {}
