@@ -10,6 +10,7 @@ import asyncio
 import pytest
 
 from app import forwarder
+from app.parser import CodeMerger
 from app.store import Store
 
 
@@ -515,6 +516,90 @@ def test_bot_relay_batches_album(store, monkeypatch):
     assert len(sent) == 1                  # 两条消息只发一次
     assert sent[0][0] == "copyMessages"
     assert sent[0][1]["message_ids"] == [10, 11]
+
+
+COLLECTOR_UID = 7680856969
+ADMIN_UID = 7250823742
+
+
+def _add_collector_account(store, user_id: int = COLLECTOR_UID) -> int:
+    account = store.add_account(phone="+8600000000000", session="collector.session")
+    aid = int(account["id"])
+    store.update_account(aid, user_id=user_id)
+    return aid
+
+
+def test_relay_senders_include_collector_accounts(store):
+    assert _add_collector_account(store) > 0
+    bot = _make_bot(store)
+    assert bot._relay_senders() == {COLLECTOR_UID}
+
+
+def test_bot_relays_video_from_collector_account(store):
+    """采集号和管理员号不是同一个时，采集号转发来的视频也要能收。"""
+    _add_collector_account(store)
+    forwarder.save_relay_target(store, chat_id=-100777, title="目标群")
+    bot = _make_bot(store)
+    sent: list[tuple[str, dict]] = []
+
+    async def fake_api_post(client, conf, method, payload):
+        sent.append((method, payload))
+        return {}
+
+    bot._api_post = fake_api_post
+    conf = {"token": "1:abc", "user_id": ADMIN_UID}
+    message = {
+        "message_id": 5,
+        "from": {"id": COLLECTOR_UID},
+        "chat": {"id": COLLECTOR_UID, "type": "private"},
+        "video": {"file_id": "x"},
+    }
+    asyncio.run(bot._handle_message(message, conf, CodeMerger(0), None))
+    assert [m for m, _ in sent] == ["copyMessage"]
+    assert sent[0][1]["chat_id"] == -100777
+
+
+def test_collector_account_cannot_run_commands(store):
+    """采集号的私聊只用来中转视频，不能拿它建秒传任务、跑 /cleanup。"""
+    _add_collector_account(store)
+    bot = _make_bot(store)
+    sent: list[tuple[str, dict]] = []
+
+    async def fake_api_post(client, conf, method, payload):
+        sent.append((method, payload))
+        return {}
+
+    bot._api_post = fake_api_post
+    conf = {"token": "1:abc", "user_id": ADMIN_UID}
+    message = {
+        "message_id": 6,
+        "from": {"id": COLLECTOR_UID},
+        "chat": {"id": COLLECTOR_UID, "type": "private"},
+        "text": "/tasks",
+    }
+    asyncio.run(bot._handle_message(message, conf, CodeMerger(0), None))
+    assert sent == []      # 既不回命令，也不建任务
+
+
+def test_unknown_sender_is_still_ignored(store):
+    _add_collector_account(store)
+    bot = _make_bot(store)
+    sent: list[tuple[str, dict]] = []
+
+    async def fake_api_post(client, conf, method, payload):
+        sent.append((method, payload))
+        return {}
+
+    bot._api_post = fake_api_post
+    conf = {"token": "1:abc", "user_id": ADMIN_UID}
+    message = {
+        "message_id": 7,
+        "from": {"id": 999999999},
+        "chat": {"id": 999999999, "type": "private"},
+        "text": "/tasks",
+    }
+    asyncio.run(bot._handle_message(message, conf, CodeMerger(0), None))
+    assert sent == []
 
 
 def test_bot_relay_failure_is_recorded(store):

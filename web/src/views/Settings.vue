@@ -703,8 +703,9 @@ onUnmounted(() => {
           target="_blank"
           rel="noreferrer"
         >@BotFather</a>
-        创建机器人并复制 Bot Token。这里只接收和处理下方 TG 用户 ID 发来的私聊消息，
-        其他用户的消息会直接忽略。
+        创建机器人并复制 Bot Token。命令只处理和下方 TG 用户 ID 发来的私聊；
+        采集账号的私聊也会被接收（只用来把视频转进目标群，不执行命令），
+        其他用户的私聊一律忽略。
       </p>
 
       <div class="flex flex-wrap items-end gap-3">

@@ -243,26 +243,33 @@ def build_router(ctx: WebContext) -> APIRouter:
                         else:
                             add("bot 在目标群", True, str(chat.get("title") or ""))
 
-            # 最容易出事的一项：采集号不是 bot 配置的那个用户 → bot 直接忽略
+            # 采集号能不能被 bot 接收：bot 会自动放行所有采集账号
             collector_uid = int(account.get("user_id") or 0)
             bot_uid = int(bot.get("user_id") or 0)
-            if collector_uid and bot_uid:
-                same = collector_uid == bot_uid
-                add(
-                    "采集号 = bot 接收用户",
-                    same,
-                    "同一个号，转发能被 bot 收到"
-                    if same
-                    else (
-                        f"不一致：采集号 {collector_uid}，Bot 配置的是 {bot_uid}。"
-                        "bot 只认配置的那个用户，其余私聊会被直接忽略"
-                    ),
-                )
+            allowed = {int(a.get("user_id") or 0) for a in store.list_accounts()}
+            allowed.discard(0)
+            if bot_uid:
+                allowed.add(bot_uid)
+            if collector_uid:
+                ok = collector_uid in allowed
+                if collector_uid == bot_uid:
+                    detail = f"采集号就是 bot 配置的用户（{collector_uid}）"
+                elif ok:
+                    detail = (
+                        f"采集号 {collector_uid} 已作为采集账号放行"
+                        f"（命令仍只认 {bot_uid}）"
+                    )
+                else:
+                    detail = (
+                        f"采集号 {collector_uid} 不在允许列表 {sorted(allowed)}，"
+                        "它的私聊会被忽略"
+                    )
+                add("采集号能被 bot 接收", ok, detail)
             else:
                 add(
-                    "采集号 = bot 接收用户",
+                    "采集号能被 bot 接收",
                     False,
-                    "两边都要有 user_id 才能比对（先在账号页让账号同步一次用户信息）",
+                    "账号还没同步到 user_id（去账号页重新登录 / 刷新一次）",
                 )
 
             runner = getattr(ctx.app.state, "telegram_bot", None)

@@ -220,6 +220,28 @@ class TelegramBotRunner:
         self._album_tasks: dict[str, asyncio.Task] = {}
         # 没配目标群时的提醒限流（不然每条视频都刷一行日志）
         self._relay_warned_at = 0.0
+        # 采集账号的 user_id 缓存（每条私聊都要判一次，不必每次都读库）
+        self._senders_cache: set[int] = set()
+        self._senders_at = 0.0
+
+    def _relay_senders(self) -> set[int]:
+        """允许把视频转给 bot 的采集账号 user_id。
+
+        采集号和管理员号经常不是同一个号（一个受限号专门采集，另一个管后台），
+        只认配置用户的话，采集号转发来的视频会被静默丢掉。
+        命令仍然只认配置的那个用户。
+        """
+        now = time.time()
+        if self._senders_at and now - self._senders_at < 60:
+            return set(self._senders_cache)
+        ids: set[int] = set()
+        for account in self.store.list_accounts():
+            uid = int(account.get("user_id") or 0)
+            if uid > 0:
+                ids.add(uid)
+        self._senders_cache = ids
+        self._senders_at = now
+        return set(ids)
 
     def status(self) -> dict:
         conf = resolve_bot_settings(self.store)
@@ -1124,7 +1146,12 @@ class TelegramBotRunner:
             sender_id = int(sender.get("id") or 0)
         except (TypeError, ValueError):
             return
-        if sender_id != int(conf["user_id"]):
+
+        # 允许两个来源：bot 配置的那个用户（命令）+ 已知采集账号（只用来中转视频）。
+        # 采集号和管理员号经常不是同一个，只认前者的话采集号转发过来的视频
+        # 会在这一步被静默丢掉（日志里还要翻半天）。
+        primary = int(conf["user_id"] or 0)
+        if not sender_id or (sender_id != primary and sender_id not in self._relay_senders()):
             if sender_id and sender_id not in self._ignored_senders:
                 self._ignored_senders.add(sender_id)
                 log.warning("Bot 忽略非授权用户 %s 的私聊", sender_id)
@@ -1133,6 +1160,10 @@ class TelegramBotRunner:
         text = message.get("text")
         if await self._relay_video(message, conf, client):
             # 采集号转发过来的视频：转进目标群就行，不用再当命令/链接处理
+            return
+        if primary and sender_id != primary:
+            # 采集账号的私聊只用于中转视频，不处理命令 / 链接，
+            # 免得采集号随便发点什么就建出一堆秒传任务
             return
         if not isinstance(text, str) or not text.strip():
             return
