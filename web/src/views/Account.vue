@@ -333,13 +333,17 @@ const chatColumns = computed(() => [
     title: '群组',
     key: 'title',
     minWidth: 260,
-    render: (row) =>
-      h('div', [
+    render: (row) => {
+      // 把会话 id 也带上：排查「哪个群」「为什么绑不上」时经常要它
+      const sub = [
+        row.username ? '@' + row.username : '',
+        row.chat_id ? String(row.chat_id) : '',
+      ].filter(Boolean).join(' · ')
+      return h('div', [
         h('div', row.title || row.chat_id),
-        row.username
-          ? h('div', { class: 'mono muted text-[12.5px]' }, '@' + row.username)
-          : null,
-      ]),
+        sub ? h('div', { class: 'mono muted text-[12px]' }, sub) : null,
+      ])
+    },
   },
   { title: '链接', key: 'links', width: 80, align: 'right', render: (row) => chatStat(row).links },
   { title: '消息', key: 'messages', width: 80, align: 'right', render: (row) => chatStat(row).messages },
@@ -907,6 +911,10 @@ usePolling(load, 10000)
       <div class="text-[13.5px] muted mb-3">
         支持 <b>@username</b>、<b>t.me/xxx</b>、<b>t.me/+邀请码</b>。
         加入成功后会自动勾上监控；私有群需要用邀请链接。
+        <div class="mt-1">
+          <b>-100…</b> 这种只是会话 id，<b>不能用来加群</b>：这个号已经在群里的话，
+          直接去「群组」列表勾选监控即可（也可以粘 id 定位，但前提是它已经加入了）。
+        </div>
       </div>
       <n-input
         v-model:value="joinTarget"

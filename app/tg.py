@@ -160,6 +160,12 @@ def _friendly(e: Exception) -> str:
         return "这个账号建的群/频道太多了，Telegram 限制了，换账号或先删掉一些"
     if "not enough rights" in lowered:
         return "权限不足：需要在这个群里发消息的权限"
+    if "could not find the input entity" in lowered or "peer_id_invalid" in lowered:
+        return (
+            "找不到这个会话：要么这个号还没进群，要么只给了 id 而会话里没有它的访问哈希。"
+            "加群请用 @username（公开群）或 t.me/+邀请码（私有群）；"
+            "已经在群里的，直接去「群组」列表勾选监控即可"
+        )
     return f"{type(e).__name__}: {e}"
 
 
@@ -457,6 +463,27 @@ class TelegramSession:
         m = INVITE_RE.search(raw)
         token = m.group(1) if m else raw
         is_invite = token.startswith("+") or bool(m and "joinchat/" in raw.lower())
+
+        if not is_invite and token.lstrip("-").isdigit():
+            # 纯数字 id：只能靠会话缓存里的访问哈希找到它。
+            # 这个号没进群时 Telethon 会报 Could not find the input entity —— 提前把
+            # 话说清楚，并提示怎么才能真加进去
+            try:
+                entity = await client.get_entity(int(token))
+            except Exception as e:
+                raise LoginError(
+                    f"找不到会话 {token}：这个号应该还没加入它（只有会话 id 是加不了群的）。"
+                    "公开群用 @username，私有群用 t.me/+邀请码；"
+                    "已经加入的群不需要在这里加，直接去「群组」列表勾选监控。"
+                    f"（Telegram：{str(e)[:120]}）"
+                ) from e
+            return {
+                "joined": True,
+                "already": True,
+                "chat_id": int(getattr(entity, "id", 0)) or None,
+                "title": getattr(entity, "title", "") or "",
+                "username": getattr(entity, "username", None) or "",
+            }
 
         try:
             if is_invite:

@@ -379,6 +379,18 @@ def test_basic_chat_target_uses_input_peer_chat(store):
     assert type(client.forwards[0]["entity"]).__name__ == "InputPeerChat"
 
 
+def test_entity_not_found_hint_mentions_how_to_join():
+    """粘了个 -100… id 但号不在群里时，要说清楚「id 加不了群」。"""
+    from app.tg import _friendly
+
+    text = _friendly(Exception(
+        "Could not find the input entity for PeerChannel(channel_id=4306704719) "
+        "(PeerChannel). Please read https://docs.telethon.dev"
+    ))
+    assert "@username" in text
+    assert "t.me/+邀请码" in text
+
+
 def test_spamreported_error_is_explained():
     from app.tg import _friendly
 
