@@ -29,6 +29,7 @@ from app.routers import (
     accounts,
     backup,
     chats,
+    forward,
     links,
     listener,
     settings,
@@ -39,6 +40,38 @@ from app.store import Store
 from app.tg import TelegramSession
 
 log = logging.getLogger("api")
+
+# PikPak 登录态保活间隔。access_token 一般只有两小时，10 分钟看一眼足够，
+# 既能提前续期，也能在刷新不了了的时候尽早发现并自动重登。
+PIKPAK_KEEPALIVE_SECONDS = 600
+
+
+async def _pikpak_keepalive_loop(store, proxy_resolver) -> None:
+    """定期续期 PikPak 登录态；续不上就用保存的密码自动重登。
+
+    失败不往上报：账号类问题不该把服务带下去。只把原因写进日志和登录状态，
+    让用户在设置页能看见「需要重新登录」。
+    """
+    last_error = ""
+    # 启动后先看一眼：库里存的登录态可能已经是几周前坏掉的，
+    # 等十分钟才提示就太迟了
+    delay = 60.0
+    while True:
+        await asyncio.sleep(delay)
+        delay = PIKPAK_KEEPALIVE_SECONDS
+        try:
+            result = await asyncio.to_thread(
+                integrations.pikpak_keepalive, store, proxy_resolver()
+            )
+        except Exception as e:      # 取代理这一步自己也可能抛
+            result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        error = str(result.get("error") or "")
+        # 同一句话只记一次，否则每 10 分钟刷一条，日志没法看
+        if error and error != last_error:
+            log.warning("PikPak 登录态保活失败：%s", error)
+        elif not error and last_error:
+            log.info("PikPak 登录态已恢复")
+        last_error = error
 
 
 def create_app(cfg=None, tg_session=None) -> FastAPI:
@@ -85,6 +118,9 @@ def create_app(cfg=None, tg_session=None) -> FastAPI:
             app.state.collector.start_watchdog()
 
         auto_task = asyncio.create_task(_auto_collect())
+        keeper = asyncio.create_task(
+            _pikpak_keepalive_loop(store, ctx.system_proxy)
+        )
         app.state.transfers.start()
         await app.state.telegram_bot.start()
         try:
@@ -96,6 +132,9 @@ def create_app(cfg=None, tg_session=None) -> FastAPI:
             auto_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await auto_task
+            keeper.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await keeper
             if task:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -161,6 +200,7 @@ def create_app(cfg=None, tg_session=None) -> FastAPI:
         integrations.build_router(ctx),
         accounts.build_router(ctx),
         chats.build_router(ctx),
+        forward.build_router(ctx),
         links.build_router(ctx),
         listener.build_router(ctx),
         settings.build_router(ctx),

@@ -172,6 +172,17 @@ def _one_line(value: Any, limit: int = 200) -> str:
     return text[:limit]
 
 
+def _pikpak_state_text(pikpak: dict) -> str:
+    """PikPak 三态：已登录 / 需要重新登录 / 未登录。
+
+    以前只有「已登录 / 未登录」，token 失效了也显示已登录 —— 看着正常，
+    实际上每个要登录的请求都在报错。
+    """
+    if pikpak.get("needs_login"):
+        return "需要重新登录"
+    return "已登录" if pikpak.get("connected") else "未登录"
+
+
 class TelegramBotRunner:
     """后台长轮询器。配置保存后由设置接口主动重启。"""
 
@@ -526,10 +537,13 @@ class TelegramBotRunner:
             f"🤖 Telegram Bot：<b>{'运行中' if self._task and not self._task.done() else '未运行'}</b>",
             f"👤 接收用户：<code>{conf['user_id'] or '未配置'}</code>",
             f"☁️ 光鸭：<b>{'已登录' if guangya.get('connected') else '未登录'}</b>",
-            f"📦 PikPak：<b>{'已登录' if pikpak.get('connected') else '未登录'}</b>",
+            f"📦 PikPak：<b>{_pikpak_state_text(pikpak)}</b>",
             f"📡 采集：<b>{collecting} 个运行</b> · {enabled} 个已开启",
             f"👥 TG 账号：{logged}/{len(accounts)} 在线",
         ]
+        # 登录态失效时把原因也贴出来，否则用户只看到「需要重新登录」不知道咋了
+        if pikpak.get("last_error"):
+            lines.append(f"⚠️ PikPak：{html.escape(str(pikpak['last_error'])[:200])}")
         if accounts:
             lines.extend(["", "账号状态："])
             for account in accounts[:10]:

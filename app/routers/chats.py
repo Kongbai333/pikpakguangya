@@ -62,6 +62,7 @@ def build_router(ctx: WebContext) -> APIRouter:
                 d = dict(c)
                 w = by_id.get(d.get("chat_id"))
                 d["watched"] = bool(w and w["enabled"])
+                d["forward_enabled"] = bool(w and w.get("forward_enabled"))
                 out.append(d)
             return out
 

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import re
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -17,6 +20,8 @@ from app.proxy import ProxyConfig
 from app.routers.context import WebContext
 from app.store import iso, utcnow
 
+log = logging.getLogger("integrations")
+
 PIKPAK_STATE_KEY = "integrations.pikpak"
 
 PIKPAK_CLIENT_ID = "YNxT9w7GMdWvEOKa"
@@ -25,6 +30,15 @@ PIKPAK_CAPTCHA_URL = "https://user.mypikpak.com/v1/shield/captcha/init"
 PIKPAK_LOGIN_URL = "https://user.mypikpak.com/v1/auth/signin"
 PIKPAK_TOKEN_URL = "https://user.mypikpak.com/v1/auth/token"
 PIKPAK_ABOUT_URL = "https://api-drive.mypikpak.com/drive/v1/about"
+
+# access_token 提前 5 分钟算过期：宁可比 PikPak 早一点换，别让请求卡在临界点上
+PIKPAK_TOKEN_MARGIN = timedelta(minutes=5)
+# 自动重登失败后多久才允许再试：密码改过了还反复硬试，容易被风控
+PIKPAK_RETRY_COOLDOWN = timedelta(minutes=30)
+
+
+class PikPakAuthError(ValueError):
+    """PikPak 登录态用不了：续期失败，自动重登也没成。"""
 
 # 容量缓存：进设置页先给缓存值，过期只在后台线程里刷新，接口不等网盘。
 STORAGE_TTL = 120.0
@@ -36,6 +50,8 @@ _STORAGE_LOCKS = {"pikpak": threading.Lock(), "guangya": threading.Lock()}
 class PikPakLoginIn(BaseModel):
     username: str = ""
     password: str = ""
+    # 记住密码：掉线后用密码自动重登。密码明文存在本机数据库里，等同代理密码。
+    remember: bool = True
 
 
 class GuangyaTokenIn(BaseModel):
@@ -99,14 +115,160 @@ def _mask_account(value: str) -> str:
     return value
 
 
-def _pikpak_refresh_token(store, proxy: ProxyConfig | None = None) -> str:
+def _pikpak_state(store) -> dict:
     data = store.get_json(PIKPAK_STATE_KEY, {}) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_pikpak_state(store, **fields) -> dict:
+    """读改写：只补自己的字段，别把别的线程刚写进去的新 token 冲掉。"""
+    data = _pikpak_state(store)
+    data.update(fields)
+    store.set_json(PIKPAK_STATE_KEY, data)
+    return data
+
+
+def _expires_at(seconds: Any) -> str:
+    """把 PikPak 返回的 expires_in（秒）换成绝对时间；没给就记空（视为需刷新）。"""
+    try:
+        secs = int(float(seconds or 0))
+    except (TypeError, ValueError):
+        secs = 0
+    if secs <= 0:
+        return ""
+    return iso(utcnow() + timedelta(seconds=secs))
+
+
+def _token_usable(data: dict) -> bool:
+    """access_token 是否还在有效期内（留 PIKPAK_TOKEN_MARGIN 余量）。
+
+    没记过期时间就当它不可用：多续一次只是多一个请求，
+    而拿着过期 token 去请求会直接被回 401，后者更难看。
+    """
+    if not str(data.get("access_token") or ""):
+        return False
+    raw = str(data.get("expires_at") or "")
+    if not raw:
+        return False
+    try:
+        expires = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return expires - PIKPAK_TOKEN_MARGIN > utcnow()
+
+
+def _response_detail(response: httpx.Response) -> str:
+    """把失败响应压成一句能看懂的话：状态码 + PikPak 自己的错误描述。"""
+    detail = (response.text or "").strip()
+    with contextlib.suppress(Exception):
+        body = response.json()
+        if isinstance(body, dict):
+            parts = [
+                str(body.get("error_code") or body.get("error") or ""),
+                str(body.get("error_description") or body.get("message") or ""),
+            ]
+            text = " ".join(p for p in parts if p)
+            if text:
+                detail = text
+    return f"HTTP {response.status_code} {detail}".strip()[:300]
+
+
+@contextlib.contextmanager
+def _maybe_client(proxy: ProxyConfig | None, client: httpx.Client | None):
+    """没传 client 就自己建一个（测试里注入假 client，不去碰网络）。"""
+    if client is not None:
+        yield client
+        return
+    with _client(proxy) as http:
+        yield http
+
+
+def pikpak_signin(store, proxy: ProxyConfig | None = None, *,
+                  username: str, password: str,
+                  client: httpx.Client | None = None) -> dict:
+    """账号密码登录：先换 captcha_token，再换 token。返回 PikPak 的原始响应体。"""
+    device_id = pikpak_api.device_id(store)
+    with _maybe_client(proxy, client) as http:
+        captcha = http.post(
+            PIKPAK_CAPTCHA_URL,
+            headers=_headers(device_id),
+            json={
+                "client_id": PIKPAK_CLIENT_ID,
+                "action": f"POST:{PIKPAK_LOGIN_URL}",
+                "device_id": device_id,
+                "meta": _identity_meta(username),
+            },
+        )
+        if captcha.status_code >= 400:
+            raise PikPakAuthError(
+                f"PikPak 验证码初始化失败：{_response_detail(captcha)}"
+            )
+        captcha_token = str(captcha.json().get("captcha_token") or "")
+        if not captcha_token:
+            raise PikPakAuthError("PikPak 没有返回 captcha_token")
+
+        response = http.post(
+            PIKPAK_LOGIN_URL,
+            headers=_headers(device_id),
+            json={
+                "client_id": PIKPAK_CLIENT_ID,
+                "client_secret": PIKPAK_CLIENT_SECRET,
+                "grant_type": "password",
+                "username": username,
+                "password": password,
+                "captcha_token": captcha_token,
+            },
+        )
+    if response.status_code >= 400:
+        raise PikPakAuthError(f"PikPak 登录失败：{_response_detail(response)}")
+    body = response.json()
+    if body.get("error"):
+        raise PikPakAuthError(
+            str(body.get("error_description") or body.get("error"))
+        )
+    return body
+
+
+def _store_pikpak_login(store, *, username: str, password: str, body: dict,
+                        remember: bool = True) -> dict:
+    """登录成功后落库。remember=False 把之前存的密码也清掉。"""
+    access_token = str(body.get("access_token") or "")
+    refresh_token = str(body.get("refresh_token") or "")
+    if not access_token or not refresh_token:
+        raise PikPakAuthError("PikPak 登录返回缺少 token")
+    fields: dict[str, Any] = {
+        "username": username,
+        "user_id": str(body.get("sub") or ""),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_at": _expires_at(body.get("expires_in")),
+        "updated_at": iso(utcnow()),
+        "login_required": False,
+        "last_error": "",
+        "last_auto_login_at": "",
+    }
+    if remember and password:
+        # 明文存：PikPak 没有免密登录，不存密码就无从「自动重登」
+        fields["password"] = password
+    data = _save_pikpak_state(store, **fields)
+    if not (remember and password):
+        data.pop("password", None)
+        store.set_json(PIKPAK_STATE_KEY, data)
+    return data
+
+
+def _pikpak_refresh_token(store, proxy: ProxyConfig | None = None, *,
+                          client: httpx.Client | None = None) -> str:
+    """用 refresh_token 换新的 access_token。失败一律抛 PikPakAuthError。"""
+    data = _pikpak_state(store)
     refresh_token = str(data.get("refresh_token") or "")
     if not refresh_token:
-        raise ValueError("PikPak 登录态已失效，请重新登录")
+        raise PikPakAuthError("还没有 PikPak 登录态，请先在设置里登录")
     device_id = pikpak_api.device_id(store)
-    with _client(proxy) as client:
-        response = client.post(
+    with _maybe_client(proxy, client) as http:
+        response = http.post(
             PIKPAK_TOKEN_URL,
             headers=_headers(device_id),
             json={
@@ -116,45 +278,129 @@ def _pikpak_refresh_token(store, proxy: ProxyConfig | None = None) -> str:
                 "refresh_token": refresh_token,
             },
         )
-        response.raise_for_status()
-        body = response.json()
+    if response.status_code >= 400:
+        raise PikPakAuthError(f"PikPak 续期失败：{_response_detail(response)}")
+    body = response.json()
     access_token = str(body.get("access_token") or "")
     if not access_token:
-        raise ValueError("PikPak 刷新登录态失败")
-    data.update({
-        "access_token": access_token,
-        "refresh_token": str(body.get("refresh_token") or refresh_token),
-        "updated_at": iso(utcnow()),
-    })
-    store.set_json(PIKPAK_STATE_KEY, data)
+        raise PikPakAuthError(
+            f"PikPak 续期没返回 access_token：{str(body)[:200]}"
+        )
+    _save_pikpak_state(
+        store,
+        access_token=access_token,
+        refresh_token=str(body.get("refresh_token") or refresh_token),
+        expires_at=_expires_at(body.get("expires_in")),
+        updated_at=iso(utcnow()),
+        login_required=False,
+        last_error="",
+    )
     return access_token
 
 
+def _relogin_in_cooldown(data: dict) -> bool:
+    raw = str(data.get("last_auto_login_at") or "")
+    if not raw:
+        return False
+    try:
+        at = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return utcnow() - at < PIKPAK_RETRY_COOLDOWN
+
+
+def _pikpak_password_relogin(store, proxy: ProxyConfig | None = None, *,
+                             client: httpx.Client | None = None) -> str:
+    """refresh_token 活不了了，用存下来的密码重新登录一次。
+
+    密码存的是明文（就存在本机 pikpak.db 里，和代理密码一个级别），
+    没有密码就只能等人工登录 —— 这里把话说清楚，别假装成功。
+    """
+    data = _pikpak_state(store)
+    username = str(data.get("username") or "")
+    password = str(data.get("password") or "")
+    if not username or not password:
+        raise PikPakAuthError(
+            "PikPak 登录态已失效，而且没有保存密码，只能手动重新登录"
+        )
+    if _relogin_in_cooldown(data):
+        raise PikPakAuthError(
+            "PikPak 自动重登刚失败过，半小时后再试（防止反复硬试被风控）"
+        )
+    # 先记时间再发请求：并发的另一个线程看到时间就会退让，不会一起轰登录接口
+    _save_pikpak_state(store, last_auto_login_at=iso(utcnow()))
+    body = pikpak_signin(
+        store, proxy, username=username, password=password, client=client,
+    )
+    _store_pikpak_login(store, username=username, password=password, body=body)
+    log.info("PikPak 登录态失效，已用保存的密码自动重登")
+    return str(body.get("access_token") or "")
+
+
+def pikpak_access_token(store, proxy: ProxyConfig | None = None, *,
+                        force: bool = False,
+                        client: httpx.Client | None = None) -> str:
+    """拿一个能用的 access_token。
+
+    顺序：未过期直接用 → refresh_token 续期 → 存了密码就自动重登。
+    全都不行时把原因记进状态（login_required / last_error）再抛错，
+    让设置页和 Bot 能说清「为什么说我不在线」。
+    """
+    data = _pikpak_state(store)
+    if not force and _token_usable(data):
+        return str(data["access_token"])
+
+    errors: list[str] = []
+    if data.get("refresh_token"):
+        try:
+            return _pikpak_refresh_token(store, proxy, client=client)
+        except PikPakAuthError as e:
+            errors.append(str(e))
+    try:
+        return _pikpak_password_relogin(store, proxy, client=client)
+    except PikPakAuthError as e:
+        errors.append(str(e))
+
+    detail = "；".join(errors) or "没有可用的 PikPak 登录态"
+    _save_pikpak_state(store, login_required=True, last_error=detail)
+    raise PikPakAuthError(detail)
+
+
+def pikpak_keepalive(store, proxy: ProxyConfig | None = None) -> dict:
+    """后台保活：快到期的续一次，续不上就用密码重登。给定时任务用。"""
+    data = _pikpak_state(store)
+    if not data.get("refresh_token") and not data.get("password"):
+        return {"ok": False, "skipped": "未登录"}
+    try:
+        pikpak_access_token(store, proxy)
+    except PikPakAuthError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
+
+def _pikpak_about(client: httpx.Client, device_id: str, access_token: str):
+    return client.get(
+        PIKPAK_ABOUT_URL,
+        headers={
+            **_headers(device_id),
+            "Authorization": f"Bearer {access_token}",
+        },
+    )
+
+
 def _pikpak_storage(store, proxy: ProxyConfig | None = None) -> dict:
-    data = store.get_json(PIKPAK_STATE_KEY, {}) or {}
-    access_token = str(data.get("access_token") or "")
-    if not access_token:
-        raise ValueError("请先登录 PikPak")
+    access_token = pikpak_access_token(store, proxy)
     device_id = pikpak_api.device_id(store)
     with _client(proxy) as client:
-        response = client.get(
-            PIKPAK_ABOUT_URL,
-            headers={
-                **_headers(device_id),
-                "Authorization": f"Bearer {access_token}",
-            },
-        )
+        response = _pikpak_about(client, device_id, access_token)
         if response.status_code in (401, 403):
-            access_token = _pikpak_refresh_token(store, proxy)
-            response = client.get(
-                PIKPAK_ABOUT_URL,
-                headers={
-                    **_headers(device_id),
-                    "Authorization": f"Bearer {access_token}",
-                },
-            )
-        response.raise_for_status()
-        body = response.json()
+            # 拿到手时还有效，用的时候被踢了：强制重拿一次再试
+            access_token = pikpak_access_token(store, proxy, force=True)
+            response = _pikpak_about(client, device_id, access_token)
+    if response.status_code >= 400:
+        raise PikPakAuthError(f"读取容量失败：{_response_detail(response)}")
+    body = response.json()
     quota = body.get("quota") or {}
     total = int(quota.get("limit") or 0)
     used = int(quota.get("usage") or 0)
@@ -206,12 +452,19 @@ def _storage_state(store, cache_key: str, lock_key: str, loader,
 
 def _pikpak_status(store, proxy: ProxyConfig | None = None, with_storage: bool = False,
                    force_storage: bool = False) -> dict:
-    data = store.get_json(PIKPAK_STATE_KEY, {}) or {}
-    connected = bool(data.get("refresh_token"))
+    data = _pikpak_state(store)
+    # 只看 refresh_token 字符串在不在会骗人：token 早失效了页面还写「已登录」。
+    # 有密码也算「能连上」，因为掉线后能自动重登。
+    connected = bool(data.get("refresh_token") or data.get("password"))
     out = {
         "connected": connected,
+        # 三个状态分清楚：能连 / 需要人工重新登录 / 未登录
+        "needs_login": bool(data.get("login_required")),
+        "auto_login": bool(data.get("password")),
+        "last_error": str(data.get("last_error") or ""),
         "account": _mask_account(str(data.get("username") or "")),
         "updated_at": data.get("updated_at") or "",
+        "expires_at": data.get("expires_at") or "",
         "user_id": data.get("user_id") or "",
         "storage": None,
     }
@@ -269,65 +522,17 @@ def build_router(ctx: WebContext) -> APIRouter:
         if not username or not password:
             raise HTTPException(status_code=400, detail="请填 PikPak 账号和密码")
 
-        device_id = pikpak_api.device_id(store)
-        meta = _identity_meta(username)
         try:
-            with _client(ctx.system_proxy()) as client:
-                captcha = client.post(
-                    PIKPAK_CAPTCHA_URL,
-                    headers=_headers(device_id),
-                    json={
-                        "client_id": PIKPAK_CLIENT_ID,
-                        "action": f"POST:{PIKPAK_LOGIN_URL}",
-                        "device_id": device_id,
-                        "meta": meta,
-                    },
-                )
-                captcha.raise_for_status()
-                captcha_token = str(captcha.json().get("captcha_token") or "")
-                if not captcha_token:
-                    raise ValueError("PikPak 没有返回 captcha_token")
-
-                response = client.post(
-                    PIKPAK_LOGIN_URL,
-                    headers=_headers(device_id),
-                    json={
-                        "client_id": PIKPAK_CLIENT_ID,
-                        "client_secret": PIKPAK_CLIENT_SECRET,
-                        "grant_type": "password",
-                        "username": username,
-                        "password": password,
-                        "captcha_token": captcha_token,
-                    },
-                )
-                response.raise_for_status()
-                body = response.json()
-        except httpx.HTTPStatusError as e:
-            text = (e.response.text or "")[:300]
-            raise HTTPException(status_code=400, detail=f"PikPak 登录失败：{text}") from e
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"PikPak 登录失败：{e}") from e
-
-        if body.get("error"):
-            raise HTTPException(
-                status_code=400,
-                detail=str(body.get("error_description") or body.get("error")),
+            body = pikpak_signin(
+                store, ctx.system_proxy(), username=username, password=password,
             )
-        access_token = str(body.get("access_token") or "")
-        refresh_token = str(body.get("refresh_token") or "")
-        if not access_token or not refresh_token:
-            raise HTTPException(status_code=400, detail="PikPak 登录返回缺少 token")
+            _store_pikpak_login(
+                store, username=username, password=password, body=body,
+                remember=payload.remember,
+            )
+        except PikPakAuthError as e:
+            raise HTTPException(status_code=400, detail=f"PikPak {e}") from e
 
-        store.set_json(
-            PIKPAK_STATE_KEY,
-            {
-                "username": username,
-                "user_id": str(body.get("sub") or ""),
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "updated_at": iso(utcnow()),
-            },
-        )
         store.set_json(PIKPAK_STORAGE_CACHE, {})
         return {
             "status": 200,
@@ -338,6 +543,7 @@ def build_router(ctx: WebContext) -> APIRouter:
 
     @router.post("/api/integrations/pikpak/logout")
     def pikpak_logout() -> dict:
+        # 退出登录会把保存的密码一并清掉（否则「退出」等于退不掉）
         store.set_json(PIKPAK_STATE_KEY, {})
         store.set_json(PIKPAK_STORAGE_CACHE, {})
         return {"status": 200, "pikpak": _pikpak_status(store)}

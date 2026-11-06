@@ -349,3 +349,32 @@ def test_media_feature_is_gone(client):
     assert client.post(
         "/api/watch/media", json={"chat_id": -100123, "enabled": True}
     ).status_code == 404
+
+
+# ---------- 视频转发 ----------
+def test_forward_toggle_requires_watched_chat(client):
+    """没加进监控列表的群，不该凭空多出一个转发开关。"""
+    res = client.post("/api/forward/toggle", json={"chat_id": -100999, "enabled": True})
+    assert res.status_code == 404
+
+
+def test_forward_toggle_and_snapshot(client):
+    store = client.app.state.store
+    store.add_watched(-100777, title="定向群", enabled=True)
+
+    assert client.post(
+        "/api/forward/toggle", json={"chat_id": -100777, "enabled": True}
+    ).json()["enabled"] is True
+
+    data = client.get("/api/forward").json()
+    assert data["target"] == {}          # 还没建群
+    row = next(c for c in data["chats"] if c["chat_id"] == -100777)
+    assert row["forward_enabled"] is True
+
+    # 关掉也要能持久化
+    client.post("/api/forward/toggle", json={"chat_id": -100777, "enabled": False})
+    row = next(
+        c for c in client.get("/api/forward").json()["chats"]
+        if c["chat_id"] == -100777
+    )
+    assert row["forward_enabled"] is False

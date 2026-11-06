@@ -18,6 +18,7 @@ from collections import deque
 from datetime import datetime
 from typing import Any
 
+from app import forwarder
 from app import listener as L
 from app.checkqueue import CheckQueue
 from app.parser import CodeMerger
@@ -258,6 +259,49 @@ class Collector:
                 self._mark_done(chat_id, msg_id)
                 return
 
+    async def _forward_once(self, client, event, forwarded_albums: set[int]) -> None:
+        """监控群里的新视频 → 转进自己建的转发群组。
+
+        只处理实时新消息：回溯历史不转发，否则一启动就把整个历史刷进目标群。
+        转发失败不影响采集本身 —— 拿不到的东西记下来，别把整条处理链路拖垮。
+        """
+        chat = getattr(event, "chat", None)
+        msg = getattr(event, "message", None)
+        chat_id = int(getattr(chat, "id", 0) or 0)
+        if not chat_id or msg is None:
+            return
+        if not self.store.forward_enabled(chat_id, self.account_id):
+            return
+        target = forwarder.load_target(self.store, self.account_id)
+        if not target.get("chat_id"):
+            return
+        if not forwarder.detect_video(msg):
+            return
+
+        try:
+            result = await forwarder.forward_message(
+                client, chat, msg, target, forwarded_albums=forwarded_albums,
+            )
+        except Exception as e:      # 兜底：别把事件循环带崩
+            result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        if result.get("skipped") == "album":
+            return                  # 相册里已经整组转过了
+
+        forwarder.note_result(
+            self.store, self.account_id,
+            ok=bool(result.get("ok")),
+            error=str(result.get("error") or ""),
+            source=L._chat_title(chat),
+            count=int(result.get("count") or 0),
+        )
+        if result.get("ok"):
+            self._note(
+                f"已转发 {result.get('count') or 1} 条视频 → "
+                f"{target.get('title') or '转发群'}"
+            )
+        else:
+            self._note(f"转发视频失败：{result.get('error') or '未知原因'}")
+
     async def _catchup(self, client, chats: list[Any], merger: CodeMerger) -> None:
         """运行中定期按游标重扫，把实时链路漏掉的补回来。
 
@@ -292,10 +336,13 @@ class Collector:
         store, cfg = self.store, self.cfg
         account_id = self.account_id
         merger = CodeMerger(cfg.collector.merge_window_seconds)
+        # 相册里每条消息都会触发一次事件，用它去重（只在内存里，重启清空）
+        forwarded_albums: set[int] = set()
 
         @client.on(events.NewMessage(chats=chats))
         async def _on_new(event):  # noqa: ANN001
             await self._ingest_once(event, event.chat, merger, "新消息")
+            await self._forward_once(client, event, forwarded_albums)
 
         @client.on(events.MessageEdited(chats=chats))
         async def _on_edit(event):  # noqa: ANN001

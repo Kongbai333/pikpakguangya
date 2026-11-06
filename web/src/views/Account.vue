@@ -11,6 +11,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Send,
   Trash2,
   UserRound,
   LogOut,
@@ -33,6 +34,15 @@ const selectedId = ref(0)
 const refreshedAt = ref(0)
 const chats = ref([])
 const chatsLoading = ref(false)
+
+/* ---------- 视频转发 ---------- */
+const forwardBusy = ref('')
+const forward = reactive({
+  account_id: 0,
+  target: {},
+  stats: {},
+  chats: [],
+})
 
 const selected = computed(
   () => accounts.value.find((row) => row.id === selectedId.value) || null
@@ -153,6 +163,88 @@ async function toggleWatch(row, enabled) {
   }
 }
 
+async function toggleForward(row, enabled) {
+  if (!selected.value) return
+  if (enabled && !row.watched) {
+    // 转发靠采集的实时链路，群没在监控就收不到新消息
+    row.forward_enabled = false
+    message.warning('先打开这个群的「监控」，转发才有消息来源')
+    return
+  }
+  try {
+    await api.post('/api/forward/toggle', {
+      chat_id: row.chat_id,
+      account_id: selected.value.id,
+      enabled,
+    })
+    row.forward_enabled = enabled
+    message.success(enabled ? '已开启视频转发' : '已关闭视频转发')
+  } catch (e) {
+    message.error(e.message)
+    row.forward_enabled = !enabled
+  }
+}
+
+async function loadForward() {
+  if (!selected.value) {
+    forward.target = {}
+    forward.stats = {}
+    return
+  }
+  try {
+    const data = await api.get('/api/forward', { account_id: selected.value.id })
+    forward.account_id = data.account_id || 0
+    forward.target = data.target || {}
+    forward.stats = data.stats || {}
+  } catch (e) {
+    message.error(e.message)
+  }
+}
+
+async function createForwardGroup() {
+  if (!selected.value) return
+  forwardBusy.value = 'create'
+  try {
+    const data = await api.post('/api/forward/group', {
+      account_id: selected.value.id,
+      title: 'PikPak 视频转发',
+    })
+    forward.target = data.target || {}
+    forward.stats = data.stats || {}
+    message.success(`已创建转发群组：${forward.target.title || ''}`)
+    await loadChats()
+  } catch (e) {
+    message.error(e.message)
+  } finally {
+    forwardBusy.value = ''
+  }
+}
+
+async function clearForwardGroup() {
+  if (!selected.value) return
+  dialog.warning({
+    title: '解除转发绑定',
+    content: '只取消绑定，群本身还在 Telegram 里，要删请到客户端删。',
+    positiveText: '解除',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      forwardBusy.value = 'clear'
+      try {
+        const data = await api.del('/api/forward/group', {
+          account_id: selected.value.id,
+        })
+        forward.target = data?.target || {}
+        forward.stats = data?.stats || {}
+        message.success('已解除转发绑定')
+      } catch (e) {
+        message.error(e.message)
+      } finally {
+        forwardBusy.value = ''
+      }
+    },
+  })
+}
+
 function chatStat(row) {
   const key = String(row.chat_id || '').replace(/^-/, '').replace(/^100/, '')
   const hit = (selected.value?.watched || []).find((x) => {
@@ -195,11 +287,24 @@ const chatColumns = computed(() => [
         onUpdateValue: (v) => toggleWatch(row, v),
       }),
   },
+  {
+    title: '转发',
+    key: 'forward',
+    width: 80,
+    align: 'center',
+    render: (row) =>
+      h(NSwitch, {
+        value: !!row.forward_enabled,
+        size: 'small',
+        onUpdateValue: (v) => toggleForward(row, v),
+      }),
+  },
 ])
 
 watch(selectedId, () => {
   chats.value = []
   loadChats()
+  loadForward()
 })
 
 async function openJoin(row) {
@@ -576,6 +681,47 @@ usePolling(load, 10000)
           </div>
           <div v-if="selected.collect_error" class="text-[var(--app-warn)] truncate">
             <span class="muted">采集状态：</span>{{ selected.collect_error }}
+          </div>
+        </div>
+
+        <!-- 视频转发：目标群 + 统计 -->
+        <div class="mt-3 rounded-md border border-[var(--app-border)] px-3 py-2.5">
+          <div class="flex flex-wrap items-center gap-2">
+            <Send :size="15" class="text-[var(--app-brand)]" />
+            <span class="text-[13.5px] font-medium">视频转发</span>
+            <n-tag v-if="forward.target.title" size="small" round type="success">
+              {{ forward.target.title }}
+            </n-tag>
+            <n-tag v-else size="small" round>还没有转发群组</n-tag>
+            <span class="flex-1"></span>
+            <n-button
+              size="tiny"
+              :loading="forwardBusy === 'create'"
+              @click="createForwardGroup"
+            >
+              {{ forward.target.title ? '重新建一个' : '创建转发群组' }}
+            </n-button>
+            <n-button
+              v-if="forward.target.title"
+              size="tiny"
+              tertiary
+              type="error"
+              :loading="forwardBusy === 'clear'"
+              @click="clearForwardGroup"
+            >
+              解除绑定
+            </n-button>
+          </div>
+          <div class="text-[12.5px] muted mt-1.5">
+            打开下表的「转发」开关后，新视频会实时转进这个群；只转发新消息，不从历史开始刷。
+            <span v-if="forward.stats.forwarded || forward.stats.failed">
+              已转发 {{ forward.stats.forwarded || 0 }} 组 ·
+              失败 {{ forward.stats.failed || 0 }} 次
+            </span>
+            <span v-if="forward.stats.last_at">· 最近 {{ fmtTime(forward.stats.last_at) }}</span>
+          </div>
+          <div v-if="forward.stats.last_error" class="text-[12px] text-[var(--app-danger)] mt-1">
+            {{ forward.stats.last_error }}
           </div>
         </div>
 

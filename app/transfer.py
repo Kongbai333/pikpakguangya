@@ -26,7 +26,7 @@ import httpx
 
 from app import pikpak, pikpak_api
 from app.guangya_login import GuangyaAuth, GuangyaAuthError, GuangyaLoginError
-from app.integrations import _pikpak_refresh_token
+from app.integrations import pikpak_access_token
 from app.store import iso, utcnow
 
 log = logging.getLogger("transfer")
@@ -233,7 +233,8 @@ def _request(client: httpx.Client, url: str, params: dict, store, proxy,
 
     if response.status_code == 401:
         try:
-            access_token = _pikpak_refresh_token(store, proxy)
+            # 走完整链路：续期 → 没续上就用保存的密码自动重登
+            access_token = pikpak_access_token(store, proxy, force=True)
         except Exception:
             access_token = ""
         if access_token:

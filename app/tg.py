@@ -143,6 +143,13 @@ def _friendly(e: Exception) -> str:
         return "这个操作需要管理员权限"
     if isinstance(e, E.AuthKeyUnregisteredError):
         return "登录态已失效，需要重新登录"
+    if isinstance(e, E.ChatForbiddenError):
+        return "没有权限：这个群开了「禁止转发」或你不在里面"
+    text = str(e)
+    if "CHANNELS_TOO_MUCH" in text or "TOO_MUCH" in text:
+        return "这个账号建的群/频道太多了，Telegram 限制了，换账号或先删掉一些"
+    if "not enough rights" in text.lower():
+        return "权限不足：需要在这个群里发消息的权限"
     return f"{type(e).__name__}: {e}"
 
 
@@ -475,6 +482,44 @@ class TelegramSession:
         except Exception as e:
             raise LoginError(_friendly(e)) from e
 
+    async def create_group(self, title: str = "") -> dict:
+        """建一个只有自己的超级群（megagroup），用来接转发的视频。
+
+        用 megagroup 而不是普通群：普通群 200 人上限，超了会被 Telegram 强制
+        升级成超级群，**id 会变** —— 存在库里的转发目标就废了。
+        """
+        client = await self.require_authorized()
+        from telethon.tl.functions.channels import CreateChannelRequest
+
+        name = " ".join((title or "").split())[:64]
+        if not name:
+            raise LoginError("请填群名称")
+
+        try:
+            result = await client(CreateChannelRequest(
+                title=name, about="由 PikPak 链接库转发视频", megagroup=True,
+            ))
+        except LoginError:
+            raise
+        except Exception as e:
+            raise LoginError(_friendly(e)) from e
+
+        chat = (getattr(result, "chats", None) or [None])[0]
+        if chat is None:
+            raise LoginError("Telegram 没有返回新建的群组")
+        raw_id = int(getattr(chat, "id", 0) or 0)
+        if not raw_id:
+            raise LoginError("新建群组没有 id，Telegram 返回不完整")
+        return {
+            "raw_id": raw_id,
+            # 带 -100 前缀的写法：数据库、页面、日志统一用它
+            "chat_id": int(f"-100{raw_id}"),
+            # 采集是另一条连接，没有 access_hash 就解析不出这个群
+            "access_hash": int(getattr(chat, "access_hash", 0) or 0),
+            "title": getattr(chat, "title", "") or name,
+            "kind": "megagroup",
+        }
+
     async def leave(self, chat_id: int) -> dict:
         client = await self.require_authorized()
         from telethon.tl.functions.channels import LeaveChannelRequest
@@ -485,7 +530,6 @@ class TelegramSession:
         except Exception as e:
             raise LoginError(_friendly(e)) from e
         return {"left": True, "chat_id": int(chat_id)}
-
     @staticmethod
     async def _resolve(client, token: str):
         """@username / username / t.me/username / 数字 id -> entity。"""

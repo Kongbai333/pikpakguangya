@@ -85,6 +85,8 @@ CREATE TABLE IF NOT EXISTS watched_chats (
   username   TEXT    NOT NULL DEFAULT '',
   kind       TEXT    NOT NULL DEFAULT '',
   enabled    INTEGER NOT NULL DEFAULT 1,
+  -- 视频转发：把这个群里的视频转到自己建的转发群组（和采集开关独立）
+  forward_enabled INTEGER NOT NULL DEFAULT 0,
   added_at   TEXT    NOT NULL,
   PRIMARY KEY (account_id, chat_id)
 );
@@ -483,10 +485,17 @@ class Store:
                 "ALTER TABLE accounts ADD COLUMN collect_enabled INTEGER NOT NULL DEFAULT 0"
             )
             c.execute("UPDATE accounts SET collect_enabled = active")
+        wcols = {r["name"] for r in c.execute("PRAGMA table_info(watched_chats)")}
+        if wcols and "forward_enabled" not in wcols:
+            c.execute(
+                "ALTER TABLE watched_chats"
+                " ADD COLUMN forward_enabled INTEGER NOT NULL DEFAULT 0"
+            )
         # watched_chats 里同一个群可能有两行（带 -100 和不带），统一成带 -100 的写法并合并。
         # 合并规则：enabled 取「有过启用」、标题/用户名/类型取第一个非空、added_at 取最早。
         rows = c.execute(
-            "SELECT account_id, chat_id, title, username, kind, enabled, added_at"
+            "SELECT account_id, chat_id, title, username, kind, enabled,"
+            "       forward_enabled, added_at"
             "  FROM watched_chats ORDER BY enabled DESC, added_at"
         ).fetchall()
         if any(int(r["chat_id"]) > 0 for r in rows):
@@ -497,7 +506,8 @@ class Store:
                 if key not in merged:
                     merged[key] = {
                         "title": "", "username": "", "kind": "",
-                        "enabled": 0, "added_at": r["added_at"] or "",
+                        "enabled": 0, "forward_enabled": 0,
+                        "added_at": r["added_at"] or "",
                     }
                     order.append(key)
                 m = merged[key]
@@ -505,6 +515,9 @@ class Store:
                     if not m[f] and (r[f] or ""):
                         m[f] = r[f]
                 m["enabled"] = max(m["enabled"], int(r["enabled"] or 0))
+                m["forward_enabled"] = max(
+                    m["forward_enabled"], int(r["forward_enabled"] or 0)
+                )
                 if r["added_at"] and (not m["added_at"] or r["added_at"] < m["added_at"]):
                     m["added_at"] = r["added_at"]
             c.execute("DELETE FROM watched_chats")
@@ -513,10 +526,12 @@ class Store:
                 m = merged[key]
                 c.execute(
                     "INSERT INTO watched_chats"
-                    " (account_id, chat_id, title, username, kind, enabled, added_at)"
-                    " VALUES (?,?,?,?,?,?,?)",
+                    " (account_id, chat_id, title, username, kind, enabled,"
+                    "  forward_enabled, added_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
                     (account_id, chat_id, m["title"], m["username"], m["kind"],
-                     m["enabled"], m["added_at"] or iso(utcnow())),
+                     m["enabled"], m["forward_enabled"],
+                     m["added_at"] or iso(utcnow())),
                 )
 
     # ---------- 写入 ----------
@@ -1819,6 +1834,10 @@ class Store:
             "username": row["username"] or "",
             "kind": row["kind"] or "",
             "enabled": bool(row["enabled"]),
+            "forward_enabled": (
+                bool(row["forward_enabled"])
+                if "forward_enabled" in row.keys() else False
+            ),
             "added_at": row["added_at"] or "",
         }
 
@@ -1863,6 +1882,28 @@ class Store:
                 (1 if enabled else 0, owner, canonical_chat_id(chat_id)),
             )
             return cur.rowcount > 0
+
+    def set_forward_watched(self, chat_id: int, enabled: bool,
+                            account_id: int | None = None) -> bool:
+        """开关某个群的视频转发。只改已有记录，返回有没有改到东西。"""
+        owner = self._watch_owner(account_id)
+        with self._write() as c:
+            cur = c.execute(
+                "UPDATE watched_chats SET forward_enabled = ?"
+                " WHERE account_id = ? AND chat_id = ?",
+                (1 if enabled else 0, owner, canonical_chat_id(chat_id)),
+            )
+            return cur.rowcount > 0
+
+    def forward_enabled(self, chat_id: int, account_id: int | None = None) -> bool:
+        owner = self._watch_owner(account_id)
+        with self._read() as c:
+            row = c.execute(
+                "SELECT forward_enabled FROM watched_chats"
+                " WHERE account_id = ? AND chat_id = ?",
+                (owner, canonical_chat_id(chat_id)),
+            ).fetchone()
+        return bool(row and row["forward_enabled"])
 
     def assign_orphan_watched(self) -> int:
         """把老库里 account_id=0 的监听记录归到当前账号。"""

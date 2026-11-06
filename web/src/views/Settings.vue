@@ -71,11 +71,14 @@ const backup = reactive({
   result: null,
 })
 const backupInput = ref(null)
-const pikpakForm = reactive({ username: '', password: '' })
+const pikpakForm = reactive({ username: '', password: '', remember: true })
 const guangyaForm = reactive({ phone: '', code: '' })
 const guangyaToken = ref('')
 const integrations = reactive({
-  pikpak: { connected: false, account: '', updated_at: '', user_id: '', storage: null },
+  pikpak: {
+    connected: false, account: '', updated_at: '', user_id: '', storage: null,
+    needs_login: false, auto_login: false, last_error: '', expires_at: '',
+  },
   guangya: {
     connected: false,
     code_pending: false,
@@ -98,6 +101,16 @@ const folderModal = reactive({
 const currentFolderPath = computed(() =>
   '/' + folderModal.stack.slice(1).map((item) => item.name).join('/')
 )
+
+/** PikPak 三态标签：失效了就不能再显示「已登录」。 */
+const pikpakTagText = computed(() => {
+  if (integrations.pikpak.needs_login) return '需要重新登录'
+  return integrations.pikpak.connected ? '已登录' : '未登录'
+})
+const pikpakTagType = computed(() => {
+  if (integrations.pikpak.needs_login) return 'warning'
+  return integrations.pikpak.connected ? 'success' : 'default'
+})
 
 async function loadPk() {
   try {
@@ -395,6 +408,7 @@ async function loginPikPak() {
     const data = await api.post('/api/integrations/pikpak/login', {
       username: pikpakForm.username,
       password: pikpakForm.password,
+      remember: !!pikpakForm.remember,
     })
     Object.assign(integrations.pikpak, data.pikpak || {})
     pikpakForm.password = ''
@@ -749,15 +763,16 @@ onUnmounted(() => {
             class="ml-2"
             size="small"
             round
-            :type="integrations.pikpak.connected ? 'success' : 'default'"
+            :type="pikpakTagType"
           >
-            {{ integrations.pikpak.connected ? '已登录' : '未登录' }}
+            {{ pikpakTagText }}
           </n-tag>
         </div>
       </template>
 
       <p class="text-[13.5px] muted mt-0 mb-3">
-        用于读取分享目录和文件 GCID。账号密码只用于本次登录，不保存；登录态和 refresh token 存在本机数据库。
+        用于读取分享目录和文件 GCID。勾上「记住密码」后，登录态过期会用保存的密码自动重登；
+        密码明文存在本机数据库里（与代理密码同级）。
       </p>
 
       <div class="flex flex-wrap items-end gap-3">
@@ -779,6 +794,9 @@ onUnmounted(() => {
             @keyup.enter="loginPikPak"
           />
         </div>
+        <n-checkbox v-model:checked="pikpakForm.remember">
+          记住密码（掉线自动重登）
+        </n-checkbox>
         <n-button
           type="primary"
           :loading="integrationBusy === 'pikpak-login'"
@@ -803,7 +821,22 @@ onUnmounted(() => {
         <span v-if="integrations.pikpak.updated_at">
           · 登录于 {{ integrations.pikpak.updated_at }}
         </span>
+        <span v-if="!integrations.pikpak.auto_login">
+          · 未保存密码，掉线后需手动重新登录
+        </span>
       </div>
+      <n-alert
+        v-if="integrations.pikpak.needs_login"
+        class="mt-3"
+        type="warning"
+        :bordered="false"
+        title="PikPak 登录态已失效"
+      >
+        {{ integrations.pikpak.last_error || '需要重新登录' }}
+        <template v-if="integrations.pikpak.auto_login">
+          （后台会在下次保活时重试自动重登）
+        </template>
+      </n-alert>
       <div
         v-if="integrations.pikpak.storage"
         class="mt-3 rounded-xl bg-[var(--app-panel-2)] p-3 text-[12.5px] muted"

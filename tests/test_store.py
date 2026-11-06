@@ -36,9 +36,8 @@ def test_share_dedupe_and_remark_aggregation(store):
     add(store, SID_A, msg_id=2, remark="11")
     add(store, SID_A, msg_id=3, remark="XP")  # 重复备注只留一条
 
-    stats = store.stats()
-    assert stats["shares"] == 1
-    assert stats["messages"] == 3
+    assert store.stats()["shares"] == 1
+    assert store.stats()["messages"] == 3
 
     item = store.query()["items"][0]
     assert item["MSG"] == "XP / 11"
@@ -664,3 +663,48 @@ def test_transfer_job_accepts_bare_share_id(store):
         target_folder_path="/", source="web",
     )
     assert store.query(size=10)["items"][0]["LINK"] == f"https://mypikpak.com/s/{SID_A}"
+
+
+# ---------- 视频转发的开关列 ----------
+def test_forward_toggle_follows_watched_row(store):
+    store.add_watched(-100777, title="定向群", enabled=True)
+    assert store.forward_enabled(-100777) is False
+
+    assert store.set_forward_watched(-100777, True) is True
+    assert store.forward_enabled(-100777) is True
+    row = next(w for w in store.list_watched() if w["chat_id"] == -100777)
+    assert row["forward_enabled"] is True
+
+    # 没在监控列表里的群不该凭空多出一个开关
+    assert store.set_forward_watched(-100999, True) is False
+
+
+def test_forward_column_added_to_old_database(tmp_path):
+    """老库没有 forward_enabled 列：init() 要补上，且默认关闭。"""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE watched_chats (
+          account_id INTEGER NOT NULL DEFAULT 0,
+          chat_id    INTEGER NOT NULL,
+          title      TEXT NOT NULL DEFAULT '',
+          username   TEXT NOT NULL DEFAULT '',
+          kind       TEXT NOT NULL DEFAULT '',
+          enabled    INTEGER NOT NULL DEFAULT 1,
+          added_at   TEXT NOT NULL,
+          PRIMARY KEY (account_id, chat_id)
+        );
+        INSERT INTO watched_chats (account_id, chat_id, title, enabled, added_at)
+        VALUES (0, -100555, '老群', 1, '2026-01-01T00:00:00+00:00');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    s = Store(path)
+    s.init()
+    row = next(w for w in s.list_watched_all() if w["chat_id"] == -100555)
+    assert row["forward_enabled"] is False
