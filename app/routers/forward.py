@@ -350,6 +350,18 @@ def build_router(ctx: WebContext) -> APIRouter:
             if status.get("last_update_at"):
                 add("bot 最近收到消息", True, str(status["last_update_at"]))
 
+            if runner is not None and hasattr(runner, "copy_rate_status"):
+                rate = runner.copy_rate_status()
+                used = int((rate.get("chats") or {}).get(
+                    str(int(relay.get("chat_id") or 0)), 0
+                ))
+                add(
+                    "目标群发送额度",
+                    True,
+                    f"最近 {rate.get('window_seconds')} 秒已发 {used}/{rate.get('limit')} 条"
+                    "（Bot API 约 20 条/分钟/群，超了会自动排队）",
+                )
+
         watching = [
             w for w in store.list_watched(account_id=aid or None)
             if w.get("forward_enabled")

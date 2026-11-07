@@ -49,9 +49,14 @@ ALBUM_WAIT_SECONDS = 2.0
 RELAY_NOTIFY_KEY = "forward.bot.notified_at"
 # 同一种转发错误多久提醒一次，避免几十条视频全失败时刷屏
 RELAY_NOTIFY_SECONDS = 600.0
-# Bot API 对同一个群的硬限制约 20 条/分钟（官方文档）。
-# 主动放慢到每 3.3 秒一条（≈18/分钟），比撞上限后干等 retry_after 更稳。
-COPY_MIN_INTERVAL = 3.3
+# Bot API 对同一个群的硬限制约 20 条/分钟（官方文档），实际经常更早就触发。
+# 用滞动窗口计数：最近 60 秒最多发 COPY_RATE_LIMIT 条，
+# 同时两次发送至少隔 COPY_MIN_INTERVAL（官方建议 ≤1 条/秒）。
+# 注意：往目标群发的每一条都要计数，包括“来源”回复 —— 以前它没限速，
+# 等于一条视频瞬间发 2 条，度量直接被盆半。
+COPY_RATE_WINDOW = 60.0
+COPY_RATE_LIMIT = 16
+COPY_MIN_INTERVAL = 1.2
 # 撞上 429 时的重试次数（每次等 Telegram 说的秒数）
 COPY_RETRY_TIMES = 3
 # bot 侧自己再查一遍「这条源消息是不是已经投递过」：
@@ -229,8 +234,8 @@ class TelegramBotRunner:
         self._album_tasks: dict[str, asyncio.Task] = {}
         # 没配目标群时的提醒限流（不然每条视频都刷一行日志）
         self._relay_warned_at = 0.0
-        # 每个目标群上次发送的时间：用来主动限速（Bot API 约 20 条/分钟/群）
-        self._last_copy_at: dict[int, float] = {}
+        # 每个目标群的发送时间戳：用来算「最近 60 秒发了几条」
+        self._sent_at: dict[int, list[float]] = {}
         # 相册里每条消息的来源标识（用于投递后一次性入库去重）
         self._album_origins: dict[str, list[str]] = {}
         # 采集账号的 user_id 缓存（每条私聊都要判一次，不必每次都读库）
@@ -1462,7 +1467,7 @@ class TelegramBotRunner:
                         payload["caption"] = note
                     result = await self._api_post(client, conf, "copyMessage", payload)
             except bot_api.BotApiRateLimit as e:
-                self._last_copy_at[int(to_chat)] = time.time() + e.retry_after
+                # 真实限流：等 Telegram 说的秒数；这次不算额度
                 log.warning(
                     "Bot 被限流，等 %.0f 秒后重试（第 %s/%s 次）",
                     e.retry_after, attempt, COPY_RETRY_TIMES,
@@ -1472,6 +1477,7 @@ class TelegramBotRunner:
                     forwarder.note_relay_result(self.store, ok=False, error=detail[:300])
                     await self._notify_relay_error(detail, conf, client)
                     return
+                await asyncio.sleep(min(e.retry_after, 65.0))
                 continue
             except Exception as e:
                 detail = bot_api._friendly(str(e).replace(conf["token"], "***"))[:300]
@@ -1480,7 +1486,7 @@ class TelegramBotRunner:
                 await self._notify_relay_error(detail, conf, client)
                 return
             else:
-                self._last_copy_at[int(to_chat)] = time.time()
+                self._record_sent(to_chat)
                 break
 
         stats = forwarder.note_relay_result(self.store, ok=True, count=len(ids))
@@ -1493,11 +1499,51 @@ class TelegramBotRunner:
             await self._send_source_note(result, to_chat, note, conf, client)
 
     async def _wait_copy_slot(self, to_chat: int) -> None:
-        """按每群最短间隔排队，主动避开 429。"""
-        last = float(self._last_copy_at.get(int(to_chat)) or 0)
-        wait = last + COPY_MIN_INTERVAL - time.time()
-        if wait > 0:
-            await asyncio.sleep(min(wait, 60.0))
+        """按「滑动 60 秒窗口 + 最小间隔」排队，主动避开 429。
+
+        每次要往目标群发消息前先过这里：窗口内已发够就等最早那条过期，
+        而不是硬撞上去再等 retry_after。
+        """
+        chat = int(to_chat)
+        while True:
+            now = time.time()
+            stamps = [
+                t for t in self._sent_at.get(chat, [])
+                if now - t < COPY_RATE_WINDOW
+            ]
+            if len(stamps) >= COPY_RATE_LIMIT:
+                # 等最早那条滑出窗口，再多等 0.5 秒余量
+                wait = stamps[0] + COPY_RATE_WINDOW - now + 0.5
+            elif stamps and now - stamps[-1] < COPY_MIN_INTERVAL:
+                wait = COPY_MIN_INTERVAL - (now - stamps[-1])
+            else:
+                self._sent_at[chat] = stamps
+                return
+            log.info(
+                "目标群 %s 已达发送上限（%s/%s 条），等 %.1f 秒",
+                chat, len(stamps), COPY_RATE_LIMIT, wait,
+            )
+            await asyncio.sleep(min(max(wait, 0.2), 65.0))
+
+    def _record_sent(self, to_chat: int) -> None:
+        """记一次成功发送（失败的不算，不能把额度白白吃掉）。"""
+        chat = int(to_chat)
+        now = time.time()
+        stamps = [t for t in self._sent_at.get(chat, []) if now - t < COPY_RATE_WINDOW]
+        stamps.append(now)
+        self._sent_at[chat] = stamps
+
+    def copy_rate_status(self) -> dict:
+        """给诊断用：每个目标群最近 60 秒已经发了多少条。"""
+        now = time.time()
+        return {
+            "limit": COPY_RATE_LIMIT,
+            "window_seconds": int(COPY_RATE_WINDOW),
+            "chats": {
+                str(chat): len([t for t in stamps if now - t < COPY_RATE_WINDOW])
+                for chat, stamps in self._sent_at.items()
+            },
+        }
 
     async def _send_source_note(self, result, to_chat: int, note: str,
                                 conf: dict, client: httpx.AsyncClient) -> None:
@@ -1514,6 +1560,8 @@ class TelegramBotRunner:
                     head.append(mid)
         if not head:
             return
+        # 来源回复也是往目标群发消息，一样要占额度、一样要排队
+        await self._wait_copy_slot(to_chat)
         try:
             await self._api_post(client, conf, "sendMessage", {
                 "chat_id": int(to_chat),
@@ -1521,6 +1569,7 @@ class TelegramBotRunner:
                 "reply_to_message_id": head[0],
                 "disable_web_page_preview": True,
             })
+            self._record_sent(to_chat)
         except bot_api.BotApiRateLimit as e:
             # 来源只是辅助信息，撞限流就不补了，不能因为它拖住后面的视频
             log.warning("附带来源被限流，先跳过（%.0f 秒）", e.retry_after)

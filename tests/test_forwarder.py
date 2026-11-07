@@ -929,6 +929,94 @@ def _add_collector_account(store, user_id: int = COLLECTOR_UID) -> int:
     assert sent == []
 
 
+# ---------- 滑动窗口限速 ----------
+class _Clock:
+    """可控时钟：sleep 的时候时间真的往前走（不然循环会死等）。"""
+
+    def __init__(self):
+        self.now = 1_000_000.0
+
+    def time(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+
+def test_wait_copy_slot_queues_when_window_is_full(store, monkeypatch):
+    """最近 60 秒已经发满：不是硬撞 429，而是等最早那条滑出窗口再发。"""
+    from app import telegram_bot as tgb
+
+    bot = _make_bot(store)
+    clock = _Clock()
+    monkeypatch.setattr(tgb.time, "time", clock.time)
+    monkeypatch.setattr(tgb.asyncio, "sleep", clock.sleep)
+
+    chat = -100777
+    # 窗口内已经满额（每条都是 55 秒前发的）
+    bot._sent_at[chat] = [clock.now - 55] * tgb.COPY_RATE_LIMIT
+    started = clock.now
+    asyncio.run(bot._wait_copy_slot(chat))
+
+    # 等到最早那条过期（约 5 秒）才能继续
+    assert clock.now - started >= 5.0
+    # 重算后窗口里的旧记录都过期了
+    assert bot._sent_at[chat] == []
+
+
+def test_wait_copy_slot_enforces_min_interval(store, monkeypatch):
+    from app import telegram_bot as tgb
+
+    bot = _make_bot(store)
+    clock = _Clock()
+    monkeypatch.setattr(tgb.time, "time", clock.time)
+    monkeypatch.setattr(tgb.asyncio, "sleep", clock.sleep)
+
+    chat = -100777
+    bot._sent_at[chat] = [clock.now]          # 刚发完一条
+    started = clock.now
+    asyncio.run(bot._wait_copy_slot(chat))
+    assert clock.now - started >= tgb.COPY_MIN_INTERVAL - 0.01
+
+
+def test_record_sent_prunes_old_entries(store, monkeypatch):
+    from app import telegram_bot as tgb
+
+    bot = _make_bot(store)
+    clock = _Clock()
+    monkeypatch.setattr(tgb.time, "time", clock.time)
+
+    chat = -100777
+    bot._sent_at[chat] = [clock.now - 120, clock.now - 90]   # 都在窗口外
+    bot._record_sent(chat)
+    assert len(bot._sent_at[chat]) == 1
+
+
+def test_source_note_also_uses_the_rate_limiter(store, monkeypatch):
+    """来源回复也算一条消息；以前它不限速，等于把额度翻倍用掉。"""
+    from app import telegram_bot as tgb
+
+    bot = _make_bot(store)
+    clock = _Clock()
+    monkeypatch.setattr(tgb.time, "time", clock.time)
+    monkeypatch.setattr(tgb.asyncio, "sleep", clock.sleep)
+    forwarder.save_relay_target(store, chat_id=-100777, title="目标群")
+
+    sent: list[tuple[str, dict]] = []
+
+    async def fake_api_post(client, conf, method, payload):
+        sent.append((method, payload))
+        return {}
+
+    bot._api_post = fake_api_post
+    conf = {"token": "1:abc", "user_id": 42}
+    asyncio.run(bot._send_source_note(
+        {"message_id": 9}, -100777, "来源：搬运群", conf, None,
+    ))
+    assert [m for m, _ in sent] == ["sendMessage"]
+    assert len(bot._sent_at[-100777]) == 1       # 已计入额度
+
+
 def test_bot_skips_duplicate_origin(store, monkeypatch):
     """同一条源消息被转两次（采集侧重发、或手动又转一次），目标群只出一份。"""
     from app import telegram_bot as tgb
