@@ -293,6 +293,13 @@ class Collector:
                 )
             return
 
+        # 先查落库的去重记录：重启后内存集合会空，补偿回溯会把最近 60 分钟
+        # 的视频重扫一遍，不查这里就会整批重复转发。
+        mid = int(getattr(msg, "id", 0) or 0)
+        if forwarder.was_forwarded(self.store, self.account_id, chat_id, mid):
+            log.info("跳过已转发过的视频 chat=%s msg=%s", chat_id, mid)
+            return
+
         # 先记「看到了一条视频」，和 forwarded/failed 对账用
         forwarder.note_seen(self.store, self.account_id)
 
@@ -310,6 +317,12 @@ class Collector:
             result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         if result.get("skipped") == "album":
             return                  # 相册里已经整组转过了
+
+        if result.get("ok"):
+            forwarder.mark_forwarded(
+                self.store, self.account_id, chat_id,
+                result.get("ids") or [getattr(msg, "id", 0)],
+            )
 
         forwarder.note_result(
             self.store, self.account_id,

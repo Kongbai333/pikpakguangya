@@ -27,6 +27,12 @@ DEFAULT_GROUP_TITLE = "PikPak 视频转发"
 # 相册最多按这个窗口找同组消息（相册里消息 id 通常是连号的）
 ALBUM_WINDOW = 20
 
+# 已经转过的源消息（«chat_id:msg_id»），落库而不是只放内存：
+# 重启后内存集合会空，而补偿回溯会把最近 60 分钟的视频再扫一遍 ——
+# 不落库就会整批重复转发。
+DONE_KEY_PREFIX = "forward.done:"
+DONE_LIMIT = 3000
+
 # bot 中转模式下，bot 把视频发到哪个群（全局一份：bot 只有一个）
 RELAY_TARGET_KEY = "forward.bot.chat"
 # bot 自己复制消息的统计与错误
@@ -39,6 +45,45 @@ def target_key(account_id: int) -> str:
 
 def stats_key(account_id: int) -> str:
     return f"forward.stats:{int(account_id)}"
+
+
+def done_key(account_id: int) -> str:
+    return f"{DONE_KEY_PREFIX}{int(account_id)}"
+
+
+def _done_list(store, account_id: int) -> list[str]:
+    data = store.get_json(done_key(account_id), []) or []
+    return [str(x) for x in data] if isinstance(data, list) else []
+
+
+def was_forwarded(store, account_id: int, chat_id: int, message_id: int) -> bool:
+    """这条源消息是否已经转过了。"""
+    mid = int(message_id or 0)
+    if not mid:
+        return False
+    return f"{int(chat_id)}:{mid}" in set(_done_list(store, account_id))
+
+
+def mark_forwarded(store, account_id: int, chat_id: int, message_ids) -> None:
+    """记下已经转过的源消息（相册一次记一整组）。"""
+    ids = []
+    for value in message_ids or []:
+        try:
+            mid = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if mid > 0:
+            ids.append(mid)
+    if not ids:
+        return
+    data = _done_list(store, account_id)
+    known = set(data)
+    for mid in ids:
+        key = f"{int(chat_id)}:{mid}"
+        if key not in known:
+            data.append(key)
+            known.add(key)
+    store.set_json(done_key(account_id), data[-DONE_LIMIT:])
 
 
 def load_target(store, account_id: int) -> dict:
@@ -340,7 +385,7 @@ async def forward_message(client, chat, message, target: dict, *,
         forwarded_albums.add(grouped)
         if len(forwarded_albums) > 1000:      # 别无限长
             forwarded_albums.clear()
-    return {"ok": True, "count": len(ids)}
+    return {"ok": True, "count": len(ids), "ids": ids}
 
 
 def _describe_bot(error: Exception) -> str:
@@ -399,7 +444,7 @@ async def forward_to_bot(client, chat, message, target: dict, *,
         forwarded_albums.add(grouped)
         if len(forwarded_albums) > 1000:
             forwarded_albums.clear()
-    return {"ok": True, "count": len(ids)}
+    return {"ok": True, "count": len(ids), "ids": ids}
 
 
 def load_relay_target(store) -> dict:

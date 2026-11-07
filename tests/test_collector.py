@@ -24,6 +24,7 @@ class FakeClient:
         self.handlers: list = []
         self.authorized = authorized
         self.entities_requested: list = []
+        self.forwards: list = []
 
     # --- 事件 ---
     def on(self, event):  # noqa: ANN001
@@ -55,6 +56,14 @@ class FakeClient:
         return gen()
 
     async def get_messages(self, *a, **kw):  # noqa: ANN002, ANN003, ANN201
+        return []
+
+    # --- 转发 ---
+    async def forward_messages(self, entity=None, messages=None, from_peer=None,
+                               **kwargs):  # noqa: ANN001, ANN003, ANN201
+        self.forwards.append({
+            "entity": entity, "ids": list(messages or []), "from_peer": from_peer,
+        })
         return []
 
 
@@ -108,6 +117,28 @@ def make(tmp_path, *, authorized=True, credentials=True, with_proxy=True,
 
 
 # ---------- 前置检查 ----------
+def test_same_video_is_not_forwarded_twice(tmp_path):
+    """重启后补偿回溯会重扫最近 60 分钟，同一条视频不能转两次。"""
+    from app import forwarder
+
+    c, store, _, client = make(tmp_path)
+    store.set_forward_watched(CHAT_ID, True, account_id=c.account_id)
+    forwarder.save_target(
+        store, c.account_id, chat_id=-100777, raw_id=0, access_hash=0,
+        title="目标群", kind="channel", mode="bot",
+        bot_username="my_bot", bot_user_id=1,
+    )
+    msg = SimpleNamespace(id=321, grouped_id=None, video=object(), caption=None)
+    chat = SimpleNamespace(id=CHAT_ID, title="测试群")
+
+    asyncio.run(c._forward_media(client, chat, msg, set()))
+    # 模拟重启后的补偿回溯：内存里什么都没有，但库里记着已经转过
+    asyncio.run(c._forward_media(client, chat, msg, set()))
+
+    assert len(client.forwards) == 1
+    assert forwarder.load_stats(store, c.account_id)["seen"] == 1
+
+
 def test_start_blocked_by_preflight(tmp_path):
     c, _, _, _ = make(tmp_path, credentials=False, with_proxy=False, watched=False)
 

@@ -227,7 +227,8 @@ def test_album_is_forwarded_once(store):
         client, object(), FakeMessage(10, grouped=777, video=True), TARGET,
         forwarded_albums=albums,
     ))
-    assert first == {"ok": True, "count": 2}
+    assert first["ok"] is True and first["count"] == 2
+    assert first["ids"] == [10, 11]          # 给去重用（落库记录源消息）
     assert client.forwards[0]["ids"] == [10, 11]
     # 整组要用 as_album 转，否则到目标群会散成两条
     assert client.forwards[0]["as_album"] is True
@@ -292,6 +293,41 @@ def test_protected_chat_error_is_explained():
 
 
 # ---------- 目标与统计 ----------
+# ---------- 去重（重启后不能重发） ----------
+def test_forwarded_records_survive_restart(store):
+    """去重记录得落库：重启后内存没了，补偿回溯会把 60 分钟内的视频再扫一遍。"""
+    assert forwarder.was_forwarded(store, 1, -1001, 42) is False
+    forwarder.mark_forwarded(store, 1, -1001, [42, 43])
+    assert forwarder.was_forwarded(store, 1, -1001, 42) is True
+    assert forwarder.was_forwarded(store, 1, -1001, 43) is True
+    # 别的消息 / 别的群 / 别的账号都不受影响
+    assert forwarder.was_forwarded(store, 1, -1001, 44) is False
+    assert forwarder.was_forwarded(store, 1, -1002, 42) is False
+    assert forwarder.was_forwarded(store, 2, -1001, 42) is False
+
+    # 重开一个 Store（等同重启）也要能查得到
+    from app.store import Store as _Store
+
+    again = _Store(store.path)
+    assert forwarder.was_forwarded(again, 1, -1001, 42) is True
+
+
+def test_forwarded_records_are_bounded(store, monkeypatch):
+    monkeypatch.setattr(forwarder, "DONE_LIMIT", 10)
+    forwarder.mark_forwarded(store, 1, -1001, list(range(1, 9)))
+    forwarder.mark_forwarded(store, 1, -1001, list(range(9, 16)))
+    data = store.get_json(forwarder.done_key(1), [])
+    assert len(data) == 10
+    # 最新的还在，最老的已经被挤掉
+    assert forwarder.was_forwarded(store, 1, -1001, 15) is True
+    assert forwarder.was_forwarded(store, 1, -1001, 1) is False
+
+
+def test_mark_forwarded_ignores_junk(store):
+    forwarder.mark_forwarded(store, 1, -1001, [0, -5, None, "abc"])
+    assert store.get_json(forwarder.done_key(1), []) == []
+
+
 def test_target_round_trip(store):
     assert forwarder.load_target(store, 1) == {}
     forwarder.save_target(store, 1, chat_id=-1001, raw_id=1, access_hash=9, title="群")
@@ -581,7 +617,8 @@ def test_forward_to_bot_targets_the_bot_not_the_group():
     result = asyncio.run(forwarder.forward_to_bot(
         client, object(), FakeMessage(9, video=True), target,
     ))
-    assert result == {"ok": True, "count": 1}
+    assert result["ok"] is True and result["count"] == 1
+    assert result["ids"] == [9]
     # 关键：转给 bot，不是转给那个群
     assert client.forwards[0]["to"] == "my_forward_bot"
 
@@ -886,6 +923,42 @@ def _add_collector_account(store, user_id: int = COLLECTOR_UID) -> int:
     aid = int(account["id"])
     store.update_account(aid, user_id=user_id)
     return aid
+
+
+    asyncio.run(bot._handle_message(message, conf, CodeMerger(0), None))
+    assert sent == []
+
+
+def test_bot_skips_duplicate_origin(store, monkeypatch):
+    """同一条源消息被转两次（采集侧重发、或手动又转一次），目标群只出一份。"""
+    from app import telegram_bot as tgb
+
+    monkeypatch.setattr(tgb, "COPY_MIN_INTERVAL", 0)
+    forwarder.save_relay_target(store, chat_id=-100777, title="目标群")
+    bot = _make_bot(store)
+    sent: list[tuple[str, dict]] = []
+
+    async def fake_api_post(client, conf, method, payload):
+        sent.append((method, payload))
+        return {"message_id": 1}
+
+    bot._api_post = fake_api_post
+    conf = {"token": "1:abc", "user_id": 42}
+
+    def msg(dm_id: int) -> dict:
+        return {
+            "message_id": dm_id,
+            "chat": {"id": 42, "type": "private"},
+            "video": {"file_id": "x"},
+            "forward_from_chat": {"id": -1004306704719, "title": "搬运群"},
+            "forward_from_message_id": 456,       # 同一个源消息
+        }
+
+    asyncio.run(bot._relay_video(msg(5), conf, None))
+    asyncio.run(bot._relay_video(msg(6), conf, None))   # 私聊里另一条消息，但来源相同
+
+    assert [m for m, _ in sent] == ["copyMessage"]
+    assert forwarder.load_relay_stats(store)["copied"] == 1
 
 
 def test_relay_senders_include_collector_accounts(store):

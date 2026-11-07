@@ -54,6 +54,10 @@ RELAY_NOTIFY_SECONDS = 600.0
 COPY_MIN_INTERVAL = 3.3
 # 撞上 429 时的重试次数（每次等 Telegram 说的秒数）
 COPY_RETRY_TIMES = 3
+# bot 侧自己再查一遍「这条源消息是不是已经投递过」：
+# 万一采集侧去重漏了、或者手动又转了一次，不会在目标群里出现两份。
+BOT_DONE_KEY = "forward.bot.done"
+BOT_DONE_LIMIT = 3000
 
 BOT_COMMANDS = (
     {"command": "tasks", "description": "秒传任务 · 可暂停 / 终止 / 重试"},
@@ -227,6 +231,8 @@ class TelegramBotRunner:
         self._relay_warned_at = 0.0
         # 每个目标群上次发送的时间：用来主动限速（Bot API 约 20 条/分钟/群）
         self._last_copy_at: dict[int, float] = {}
+        # 相册里每条消息的来源标识（用于投递后一次性入库去重）
+        self._album_origins: dict[str, list[str]] = {}
         # 采集账号的 user_id 缓存（每条私聊都要判一次，不必每次都读库）
         self._senders_cache: set[int] = set()
         self._senders_at = 0.0
@@ -1325,6 +1331,11 @@ class TelegramBotRunner:
 
         group = str(message.get("media_group_id") or "")
         note = self._source_note(message)
+        origin = self._origin_key(message)
+        if origin and self._already_copied(origin):
+            # 采集侧重发了同一条（重启后的补偿回溯、或手动又转了一次）
+            log.info("跳过重复视频：来源 %s 已经投递过", origin)
+            return True
         log.info(
             "Bot 收到待转发视频 msg=%s from=%s album=%s → 群 %s",
             msg_id, from_chat, group or "-", chat_id,
@@ -1332,6 +1343,8 @@ class TelegramBotRunner:
         if group:
             # 相册：等同一个 media_group_id 的消息齐了再 copyMessages
             self._album_pending.setdefault(group, []).append(msg_id)
+            if origin:
+                self._album_origins.setdefault(group, []).append(origin)
             task = self._album_tasks.get(group)
             if task is None or task.done():
                 self._album_tasks[group] = asyncio.create_task(
@@ -1343,8 +1356,37 @@ class TelegramBotRunner:
             [msg_id], from_chat, chat_id, conf, client, note,
             # 原文没配文字时，把来源直接写进 caption，省一条消息
             caption_ok=not str(message.get("caption") or "").strip(),
+            origins=[origin] if origin else [],
         )
         return True
+
+    @staticmethod
+    def _origin_key(message: dict) -> str:
+        """「哪个群的哪条消息」—— 用来去重，不是给用户看的。"""
+        origin = message.get("forward_origin") or {}
+        chat = message.get("forward_from_chat") or (origin.get("chat") or {})
+        chat_id = int(chat.get("id") or 0)
+        msg_id = int(
+            message.get("forward_from_message_id") or origin.get("message_id") or 0
+        )
+        return f"{chat_id}:{msg_id}" if chat_id and msg_id else ""
+
+    def _already_copied(self, key: str) -> bool:
+        data = self.store.get_json(BOT_DONE_KEY, []) or []
+        return key in (data if isinstance(data, list) else [])
+
+    def _mark_copied(self, keys) -> None:
+        keys = [str(k) for k in (keys or []) if k]
+        if not keys:
+            return
+        data = self.store.get_json(BOT_DONE_KEY, []) or []
+        data = [str(x) for x in data] if isinstance(data, list) else []
+        known = set(data)
+        for key in keys:
+            if key not in known:
+                data.append(key)
+                known.add(key)
+        self.store.set_json(BOT_DONE_KEY, data[-BOT_DONE_LIMIT:])
 
     @staticmethod
     def _source_note(message: dict) -> str:
@@ -1377,13 +1419,18 @@ class TelegramBotRunner:
                            note: str = "") -> None:
         await asyncio.sleep(ALBUM_WAIT_SECONDS)
         ids = sorted(self._album_pending.pop(group, []))
+        origins = self._album_origins.pop(group, [])
         self._album_tasks.pop(group, None)
         if ids:
-            await self._copy_videos(ids, from_chat, to_chat, conf, client, note)
+            await self._copy_videos(
+                ids, from_chat, to_chat, conf, client, note,
+                origins=origins,
+            )
 
     async def _copy_videos(self, ids: list[int], from_chat: int, to_chat: int,
                           conf: dict, client: httpx.AsyncClient,
-                          note: str = "", caption_ok: bool = False) -> None:
+                          note: str = "", caption_ok: bool = False,
+                          origins: list[str] | None = None) -> None:
         """把视频投到目标群；带主动限速和 429 重试。
 
           - Bot API 同一个群约 20 条/分钟，这里先自己放慢，不靠撞了再说；
@@ -1437,6 +1484,7 @@ class TelegramBotRunner:
                 break
 
         stats = forwarder.note_relay_result(self.store, ok=True, count=len(ids))
+        self._mark_copied(origins)
         log.info(
             "Bot 已投递 %s 条到群 %s（累计 %s 条，失败 %s 次）",
             len(ids), to_chat, stats.get("copied"), stats.get("failed"),
@@ -1505,6 +1553,7 @@ class TelegramBotRunner:
         for task in self._album_tasks.values():
             task.cancel()
         self._album_tasks.clear()
+        self._album_origins.clear()
         if not pending:
             return 0
         target = forwarder.load_relay_target(self.store)
