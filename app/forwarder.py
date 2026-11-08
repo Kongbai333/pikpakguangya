@@ -39,6 +39,41 @@ RELAY_TARGET_KEY = "forward.bot.chat"
 RELAY_STATS_KEY = "forward.bot.stats"
 
 
+def source_chat_id(chat) -> int:
+    from telethon import utils
+    try:
+        return int(utils.get_peer_id(chat))
+    except (TypeError, ValueError, AttributeError):
+        cid = int(getattr(chat, "id", 0) or 0)
+        return -int(f"100{cid}") if cid > 0 else cid
+
+
+def delivery_scope(target: dict) -> str:
+    destination = bot_chat_id(target)
+    if target.get("mode") == "bot":
+        bot = target.get("bot_user_id") or str(target.get("bot_username") or "").lower()
+        return f"relay-out:{bot}:{destination}"
+    return f"direct:{destination}"
+
+
+def seed_collector_history(store, account_id: int, target: dict) -> None:
+    keys = []
+    for value in _done_list(store, account_id):
+        try:
+            cid, mid = map(int, value.rsplit(":", 1))
+        except (TypeError, ValueError):
+            continue
+        keys.append(f"src:{cid}:{mid}")
+        if cid > 0:
+            keys.append(f"src:-100{cid}:{mid}")
+    store.seed_forward_history(delivery_scope(target), done_key(account_id), keys)
+
+
+def _send_uncertain(error: Exception) -> bool:
+    from telethon.errors import RPCError
+    return not isinstance(error, (RPCError, ValueError, TypeError))
+
+
 def target_key(account_id: int) -> str:
     return f"forward.target:{int(account_id)}"
 
@@ -329,18 +364,19 @@ def _target_entity(target: dict):
 
 
 async def forward_message(client, chat, message, target: dict, *,
-                          forwarded_albums: set[int] | None = None) -> dict:
+                          forwarded_albums: set[int] | None = None,
+                          source_ids: list[int] | None = None) -> dict:
     """采集号直接发到目标群（相册整组）。返回 {ok, count, error, skipped}。"""
     if not target.get("chat_id"):
         return {"ok": False, "skipped": "no-target", "error": "还没有设置转发目标群"}
 
     grouped = getattr(message, "grouped_id", None)
-    if grouped and forwarded_albums is not None:
+    if source_ids is None and grouped and forwarded_albums is not None:
         if grouped in forwarded_albums:
             # 相册里的第 2..n 条消息会各自触发一次事件，别重复转
             return {"ok": True, "skipped": "album", "count": 0}
 
-    ids = await album_ids(client, chat, message)
+    ids = list(source_ids) if source_ids is not None else await album_ids(client, chat, message)
     if not ids:
         return {"ok": False, "skipped": "empty", "error": "消息没有 id"}
 
@@ -358,7 +394,13 @@ async def forward_message(client, chat, message, target: dict, *,
             as_album=len(ids) > 1,
         )
     except Exception as e:
-        return {"ok": False, "error": _describe(e), "count": 0}
+        return {"ok": False, "error": _describe(e), "count": 0,
+                "uncertain": _send_uncertain(e)}
+
+    rows = sent if isinstance(sent, (list, tuple)) else [sent]
+    if len(rows) != len(ids) or any(not getattr(row, "id", 0) for row in rows):
+        return {"ok": False, "count": 0, "uncertain": True,
+                "error": "Telegram 转发结果不完整，待核对，不自动重发"}
 
     # 转发不包含「原消息在哪」的信息（私群尤其看不出），补一条可点的来源回复
     if link_source_enabled(target):
@@ -408,7 +450,8 @@ def _describe_bot(error: Exception) -> str:
 
 
 async def forward_to_bot(client, chat, message, target: dict, *,
-                         forwarded_albums: set[int] | None = None) -> dict:
+                         forwarded_albums: set[int] | None = None,
+                         source_ids: list[int] | None = None) -> dict:
     """把视频转发给 bot 私聊，剩下的交给 bot（它再 copyMessage 到群）。
 
     为什么不直接发到群：采集号大量往群里扔大文件更容易被风控，
@@ -423,28 +466,34 @@ async def forward_to_bot(client, chat, message, target: dict, *,
                 "error": "还没绑定 bot（先在设置里填 Bot Token 并绑定）"}
 
     grouped = getattr(message, "grouped_id", None)
-    if grouped and forwarded_albums is not None and grouped in forwarded_albums:
+    if source_ids is None and grouped and forwarded_albums is not None and grouped in forwarded_albums:
         return {"ok": True, "skipped": "album", "count": 0}
 
-    ids = await album_ids(client, chat, message)
+    ids = list(source_ids) if source_ids is not None else await album_ids(client, chat, message)
     if not ids:
         return {"ok": False, "skipped": "empty", "error": "消息没有 id"}
 
     try:
-        await client.forward_messages(
+        sent = await client.forward_messages(
             entity=peer,
             messages=ids,
             from_peer=chat,
             as_album=len(ids) > 1,
         )
     except Exception as e:
-        return {"ok": False, "error": _describe_bot(e), "count": 0}
+        return {"ok": False, "error": _describe_bot(e), "count": 0,
+                "uncertain": _send_uncertain(e)}
 
     if grouped and forwarded_albums is not None:
         forwarded_albums.add(grouped)
         if len(forwarded_albums) > 1000:
             forwarded_albums.clear()
-    return {"ok": True, "count": len(ids), "ids": ids}
+    rows = sent if isinstance(sent, (list, tuple)) else [sent]
+    relay_ids = [int(getattr(row, "id", 0) or 0) for row in rows]
+    if len(relay_ids) != len(ids) or not all(relay_ids):
+        return {"ok": False, "count": 0, "uncertain": True,
+                "error": "交给 Bot 的转发结果不完整，待核对，不自动重发"}
+    return {"ok": True, "count": len(ids), "ids": ids, "relay_ids": relay_ids}
 
 
 def load_relay_target(store) -> dict:

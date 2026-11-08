@@ -230,14 +230,18 @@ class TelegramBotRunner:
         self._suppressed_jobs: set[int] = set()
         self._pending_account_actions: dict[int, dict] = {}
         # 视频中转：相册要等同一个 media_group_id 的消息到齐再一次性 copyMessages
-        self._album_pending: dict[str, list[int]] = {}
+        self._album_pending: dict[str, dict[int, list[str]]] = {}
         self._album_tasks: dict[str, asyncio.Task] = {}
+        self._album_context: dict[str, dict] = {}
+        self._album_sending: set[str] = set()
+        self._relay_pending_keys: set[tuple[str, str]] = set()
+        self._delivery_locks: dict[int, asyncio.Lock] = {}
+        self._copy_blocked_until: dict[int, float] = {}
+        self._relay_stopping = False
         # 没配目标群时的提醒限流（不然每条视频都刷一行日志）
         self._relay_warned_at = 0.0
         # 每个目标群的发送时间戳：用来算「最近 60 秒发了几条」
         self._sent_at: dict[int, list[float]] = {}
-        # 相册里每条消息的来源标识（用于投递后一次性入库去重）
-        self._album_origins: dict[str, list[str]] = {}
         # 采集账号的 user_id 缓存（每条私聊都要判一次，不必每次都读库）
         self._senders_cache: set[int] = set()
         self._senders_at = 0.0
@@ -280,6 +284,7 @@ class TelegramBotRunner:
             return
         self._last_error = ""
         self._stop.clear()
+        self._relay_stopping = False
         self._job_events = asyncio.Queue()
         loop = asyncio.get_running_loop()
         self._task = asyncio.create_task(self._run(), name="telegram-bot")
@@ -391,11 +396,13 @@ class TelegramBotRunner:
                         if not response.is_success or not data.get("ok"):
                             detail = data.get("description") or response.text[:200]
                             if response.status_code == 409:
-                                detail = "Bot Token 正在被 Webhook 或另一个 getUpdates 占用"
+                                detail = "409 Conflict：Bot Token 正在被 Webhook 或另一个 getUpdates 占用"
                             raise RuntimeError(f"Telegram Bot API 错误：{detail}")
 
                         self._last_error = ""
                         for update in data.get("result") or []:
+                            if self._stop.is_set():
+                                break
                             if not isinstance(update, dict):
                                 continue
                             await self._handle_update(update, conf, merger, client)
@@ -1089,7 +1096,9 @@ class TelegramBotRunner:
             ) from e
         if not response.is_success or not data.get("ok"):
             detail = data.get("description") or response.text[:200]
-            raise RuntimeError(f"Telegram Bot API 错误：{detail}")
+            if response.status_code == 429 or data.get("error_code") == 429:
+                raise bot_api.BotApiRateLimit(str(detail), bot_api._retry_after(str(detail), data))
+            raise bot_api.BotApiError(f"Telegram Bot API 错误：{detail}")
         return data.get("result") or {}
 
     async def _send_message(self, client: httpx.AsyncClient, conf: dict,
@@ -1306,65 +1315,69 @@ class TelegramBotRunner:
         doc = message.get("document") or {}
         return str(doc.get("mime_type") or "").startswith("video/")
 
+    @staticmethod
+    def _delivery_scope(to_chat: int, conf: dict) -> str:
+        return f"bot-in:{str(conf.get('token') or '').split(':', 1)[0]}:{int(to_chat)}"
+
     async def _relay_video(self, message: dict, conf: dict,
                            client: httpx.AsyncClient) -> bool:
-        """采集号转发过来的视频 → 复制到目标群。返回 True 表示这条已经处理。
-
-        采号只负责把视频丢进 bot 私聊，真正往群里发的是 bot：
-        Bot API 的配额和用户账号的风控是两套东西，不容易连坐采集号。
-        """
-        target = forwarder.load_relay_target(self.store)
-        chat_id = int(target.get("chat_id") or 0)
         if not self._is_video_message(message):
-            if message.get("sticker") or message.get("animation"):
-                log.debug("Bot 跳过表情/GIF，不转发 msg=%s", message.get("message_id"))
             return False
-        if not chat_id:
-            # 最常见的“日志说转了、群里却没有”：目标没绑，或者被直连/解除绑定清了
-            now = time.time()
-            if now - self._relay_warned_at > RELAY_NOTIFY_SECONDS:
-                self._relay_warned_at = now
-                log.warning(
-                    "Bot 收到视频，但没有 bot 转发目标群"
-                    "（去「账号监控 → 视频转发」用 bot 模式绑定一个），这条不会投递"
-                )
+        target = forwarder.load_relay_target(self.store)
+        to_chat = int(target.get("chat_id") or 0)
+        if not to_chat:
+            log.warning("Bot 收到视频但没有绑定目标，msg=%s", message.get("message_id"))
             return False
-        msg_id = int(message.get("message_id") or 0)
-        from_chat = int((message.get("chat") or {}).get("id") or 0)
-        if not msg_id or not from_chat:
+        mid = int(message.get("message_id") or 0)
+        sender = int((message.get("chat") or {}).get("id") or 0)
+        if not mid or not sender:
             return False
-
-        group = str(message.get("media_group_id") or "")
-        note = self._source_note(message)
+        bot_id = str(conf.get("token") or "").split(":", 1)[0]
+        mapping = self.store.get_forward_relay_source(bot_id, sender, mid)
         origin = self._origin_key(message)
-        # 兜底键：私聊里的消息 id。普通群的转发拿不到 forward_from_chat，
-        # 这时只能靠它去重（bot 重复投递、或采集侧重发都会命中）。
-        dedupe_keys = [k for k in (origin, f"dm:{from_chat}:{msg_id}") if k]
-        if any(self._already_copied(k) for k in dedupe_keys):
-            log.info("跳过重复视频：%s 已经投递过", origin or f"dm:{from_chat}:{msg_id}")
+        if not mapping and not origin and sender in self._relay_senders():
+            # The Bot update can arrive just before the first-hop response is stored.
+            for _ in range(3):
+                await asyncio.sleep(0.1)
+                mapping = self.store.get_forward_relay_source(bot_id, sender, mid)
+                if mapping:
+                    break
+        note = self._source_note(message)
+        if mapping:
+            origin = f"{mapping['source_chat']}:{mapping['source_message']}"
+            to_chat = int(mapping["target_chat"])
+            note = forwarder.source_text(mapping.get("source_title") or str(mapping["source_chat"]),
+                forwarder.message_link(mapping["source_chat"], mapping.get("source_username", ""),
+                                       mapping["source_message"]))
+        scope = self._delivery_scope(to_chat, conf)
+        legacy = self.store.get_json(BOT_DONE_KEY, []) or []
+        self.store.seed_forward_history(scope, BOT_DONE_KEY,
+            [str(k) if str(k).startswith("dm:") else f"src:{k}"
+             for k in legacy] if isinstance(legacy, list) else [])
+        keys = ([f"src:{origin}"] if origin else []) + [f"dm:{sender}:{mid}"]
+        reservations = {(scope, key) for key in keys}
+        if reservations & self._relay_pending_keys:
+            log.info("跳过排队/发送中的重复视频 scope=%s keys=%s", scope, keys)
             return True
-        log.info(
-            "Bot 收到待转发视频 msg=%s from=%s album=%s → 群 %s",
-            msg_id, from_chat, group or "-", chat_id,
-        )
+        self._relay_pending_keys.update(reservations)
+        group = str(message.get("media_group_id") or "")
+        log.info("Bot 收到视频 scope=%s from=%s msg=%s album=%s", scope, sender, mid, group or "-")
         if group:
-            # 相册：等同一个 media_group_id 的消息齐了再 copyMessages
-            self._album_pending.setdefault(group, []).append(msg_id)
-            if dedupe_keys:
-                self._album_origins.setdefault(group, []).extend(dedupe_keys)
-            task = self._album_tasks.get(group)
+            album = f"{scope}:{sender}:{group}"
+            self._album_pending.setdefault(album, {})[mid] = keys
+            self._album_context[album] = {"from_chat": sender, "to_chat": to_chat,
+                                          "conf": dict(conf), "note": note}
+            task = self._album_tasks.get(album)
             if task is None or task.done():
-                self._album_tasks[group] = asyncio.create_task(
-                    self._flush_album(group, from_chat, chat_id, conf, client, note)
-                )
+                self._album_tasks[album] = asyncio.create_task(
+                    self._flush_album(album, sender, to_chat, conf, client, note))
             return True
-
-        await self._copy_videos(
-            [msg_id], from_chat, chat_id, conf, client, note,
-            # 原文没配文字时，把来源直接写进 caption，省一条消息
-            caption_ok=not str(message.get("caption") or "").strip(),
-            origins=dedupe_keys,
-        )
+        try:
+            await self._copy_videos([mid], sender, to_chat, conf, client, note,
+                caption_ok=not str(message.get("caption") or "").strip(),
+                item_keys={mid: keys})
+        finally:
+            self._relay_pending_keys.difference_update(reservations)
         return True
 
     @staticmethod
@@ -1422,130 +1435,149 @@ class TelegramBotRunner:
         return forwarder.source_text(title, link)
 
     async def _flush_album(self, group: str, from_chat: int, to_chat: int,
-                           conf: dict, client: httpx.AsyncClient,
-                           note: str = "") -> None:
-        await asyncio.sleep(ALBUM_WAIT_SECONDS)
-        ids = sorted(self._album_pending.pop(group, []))
-        origins = self._album_origins.pop(group, [])
-        self._album_tasks.pop(group, None)
-        if ids:
-            await self._copy_videos(
-                ids, from_chat, to_chat, conf, client, note,
-                origins=origins,
-            )
+                           conf: dict, client: httpx.AsyncClient, note: str = "") -> None:
+        try:
+            while self._album_pending.get(group):
+                if not self._relay_stopping:
+                    await asyncio.sleep(ALBUM_WAIT_SECONDS)
+                items = self._album_pending.pop(group, {})
+                if not items:
+                    break
+                context = self._album_context[group]
+                scope = self._delivery_scope(context["to_chat"], context["conf"])
+                self._album_sending.add(group)
+                try:
+                    # A poll reconnect/exit must not close an active album's client.
+                    async with httpx.AsyncClient(proxy=self._proxy_url(), timeout=35) as delivery_client:
+                        await self._copy_videos(sorted(items), context["from_chat"],
+                            context["to_chat"], context["conf"], delivery_client,
+                            context.get("note", ""), item_keys=items)
+                finally:
+                    self._album_sending.discard(group)
+                    self._relay_pending_keys.difference_update(
+                        (scope, key) for keys in items.values() for key in keys)
+        finally:
+            # Keep the task registered throughout HTTP delivery, not just batching.
+            self._album_tasks.pop(group, None)
+            if not self._album_pending.get(group):
+                self._album_context.pop(group, None)
 
     async def _copy_videos(self, ids: list[int], from_chat: int, to_chat: int,
-                          conf: dict, client: httpx.AsyncClient,
-                          note: str = "", caption_ok: bool = False,
-                          origins: list[str] | None = None) -> None:
-        """把视频投到目标群；带主动限速和 429 重试。
+                          conf: dict, client: httpx.AsyncClient, note: str = "",
+                          caption_ok: bool = False, origins: list[str] | None = None,
+                          item_keys: dict | None = None) -> bool:
+        lock = self._delivery_locks.setdefault(int(to_chat), asyncio.Lock())
+        async with lock:
+            # Recheck/claim after queueing, not before an await on the rate limiter.
+            await self._wait_copy_slot(to_chat, count=len(set(ids)))
+            scope = self._delivery_scope(to_chat, conf)
+            claims = {}
+            for mid in sorted(set(ids)):
+                keys = (item_keys or {}).get(mid) or (origins if len(ids) == 1 else None)
+                keys = list(keys or [f"dm:{from_chat}:{mid}"])
+                owner = self.store.claim_forward_delivery(scope, keys)
+                if owner:
+                    claims[mid] = (owner, keys)
+            if not claims:
+                log.info("跳过数据库已记录/其他任务发送中的视频 scope=%s ids=%s", scope, ids)
+                return False
+            ids = list(claims)
+            relay = forwarder.load_relay_target(self.store)
+            use_caption = bool(note) and caption_ok and len(ids) == 1 and forwarder.link_source_enabled(relay)
+            result = None
+            dispatched = False
 
-          - Bot API 同一个群约 20 条/分钟，这里先自己放慢，不靠撞了再说；
-          - 真撞上 429 就按 Telegram 给的 retry_after 等一下再试，
-            而不是直接丢那条视频。
-        """
-        relay = forwarder.load_relay_target(self.store)
-        use_caption = bool(note) and caption_ok and len(ids) == 1 \
-            and forwarder.link_source_enabled(relay)
+            def finish(status: str, error: str = "", posted=None):
+                for owner, _ in claims.values():
+                    self.store.finish_forward_delivery(scope, owner, status,
+                        error=error, result_ids=posted or [])
 
-        result = None
-        for attempt in range(1, COPY_RETRY_TIMES + 1):
-            await self._wait_copy_slot(to_chat)
             try:
-                if len(ids) > 1:
-                    result = await self._api_post(client, conf, "copyMessages", {
-                        "chat_id": int(to_chat),
-                        "from_chat_id": int(from_chat),
-                        "message_ids": list(ids),
-                    })
-                else:
-                    payload: dict[str, Any] = {
-                        "chat_id": int(to_chat),
-                        "from_chat_id": int(from_chat),
-                        "message_id": ids[0],
-                    }
-                    if use_caption:
-                        # 塞进 caption 就不必再发一条来源消息，吞吐直接翻倍
-                        payload["caption"] = note
-                    result = await self._api_post(client, conf, "copyMessage", payload)
-            except bot_api.BotApiRateLimit as e:
-                # 真实限流：等 Telegram 说的秒数；这次不算额度
-                log.warning(
-                    "Bot 被限流，等 %.0f 秒后重试（第 %s/%s 次）",
-                    e.retry_after, attempt, COPY_RETRY_TIMES,
-                )
-                if attempt >= COPY_RETRY_TIMES:
-                    detail = f"Bot API 限流，重试 {COPY_RETRY_TIMES} 次仍未成功：{e}"
-                    forwarder.note_relay_result(self.store, ok=False, error=detail[:300])
-                    await self._notify_relay_error(detail, conf, client)
-                    return
-                await asyncio.sleep(min(e.retry_after, 65.0))
-                continue
+                for attempt in range(COPY_RETRY_TIMES):
+                    if attempt:
+                        await self._wait_copy_slot(to_chat, count=len(ids))
+                    try:
+                        dispatched = True
+                        if len(ids) > 1:
+                            result = await self._api_post(client, conf, "copyMessages", {
+                                "chat_id": int(to_chat), "from_chat_id": int(from_chat),
+                                "message_ids": ids})
+                        else:
+                            payload = {"chat_id": int(to_chat), "from_chat_id": int(from_chat),
+                                       "message_id": ids[0]}
+                            if use_caption:
+                                payload["caption"] = note
+                            result = await self._api_post(client, conf, "copyMessage", payload)
+                        break
+                    except bot_api.BotApiRateLimit as e:
+                        dispatched = False  # Telegram explicitly rejected this attempt.
+                        if attempt + 1 >= COPY_RETRY_TIMES:
+                            raise
+                        self._copy_blocked_until[int(to_chat)] = time.time() + e.retry_after
+                        log.warning("Bot 429 scope=%s retry_after=%s attempt=%s", scope, e.retry_after, attempt + 1)
+                        await asyncio.sleep(e.retry_after)
+                rows = result if isinstance(result, list) else [result]
+                posted = [int(row.get("message_id") or 0) if isinstance(row, dict) else 0
+                          for row in rows]
+                confirmed = len([mid for mid in posted if mid])
+                if confirmed:
+                    self._record_sent(to_chat, count=confirmed)
+                if len(posted) != len(ids) or not all(posted):
+                    # copyMessages may skip messages. Do not blindly retry a partial result.
+                    raise RuntimeError(f"投递结果不完整：请求 {len(ids)} 条，确认 {len([p for p in posted if p])} 条；待核对，不自动重发")
+                finish("sent", posted=posted)
+                self._mark_copied([key for _, keys in claims.values() for key in keys])
+                forwarder.note_relay_result(self.store, ok=True, count=len(posted))
+                log.info("Bot 投递成功 scope=%s from=%s ids=%s destination_ids=%s",
+                         scope, from_chat, ids, posted)
+            except asyncio.CancelledError:
+                finish("uncertain" if dispatched else "failed", "停止期间投递未完成，待核对")
+                raise
             except Exception as e:
+                uncertain = dispatched and not isinstance(e, bot_api.BotApiError)
                 detail = bot_api._friendly(str(e).replace(conf["token"], "***"))[:300]
+                if uncertain:
+                    detail = "发送结果待核对，不自动重发：" + detail
+                finish("uncertain" if uncertain else "failed", detail)
                 forwarder.note_relay_result(self.store, ok=False, error=detail)
-                log.warning("Bot 转发视频到群失败：%s", detail)
+                log.warning("Bot 投递未完成 scope=%s ids=%s error=%s", scope, ids, detail)
                 await self._notify_relay_error(detail, conf, client)
-                return
-            else:
-                self._record_sent(to_chat)
-                break
+                return False
+            if not use_caption:
+                await self._send_source_note(result, to_chat, note, conf, client)
+            return True
 
-        stats = forwarder.note_relay_result(self.store, ok=True, count=len(ids))
-        self._mark_copied(origins)
-        log.info(
-            "Bot 已投递 %s 条到群 %s（累计 %s 条，失败 %s 次）",
-            len(ids), to_chat, stats.get("copied"), stats.get("failed"),
-        )
-        if not use_caption:
-            await self._send_source_note(result, to_chat, note, conf, client)
-
-    async def _wait_copy_slot(self, to_chat: int) -> None:
-        """按「滑动 60 秒窗口 + 最小间隔」排队，主动避开 429。
-
-        每次要往目标群发消息前先过这里：窗口内已发够就等最早那条过期，
-        而不是硬撞上去再等 retry_after。
-        """
+    async def _wait_copy_slot(self, to_chat: int, count: int = 1) -> None:
         chat = int(to_chat)
+        count = max(1, min(int(count), COPY_RATE_LIMIT))
         while True:
             now = time.time()
-            stamps = [
-                t for t in self._sent_at.get(chat, [])
-                if now - t < COPY_RATE_WINDOW
-            ]
-            if len(stamps) >= COPY_RATE_LIMIT:
-                # 等最早那条滑出窗口，再多等 0.5 秒余量
-                wait = stamps[0] + COPY_RATE_WINDOW - now + 0.5
+            stamps = [t for t in self._sent_at.get(chat, []) if now - t < COPY_RATE_WINDOW]
+            blocked = self._copy_blocked_until.get(chat, 0) - now
+            if blocked > 0:
+                wait = blocked
+            elif len(stamps) + count > COPY_RATE_LIMIT:
+                excess = len(stamps) + count - COPY_RATE_LIMIT
+                wait = stamps[excess - 1] + COPY_RATE_WINDOW - now + 0.5
             elif stamps and now - stamps[-1] < COPY_MIN_INTERVAL:
                 wait = COPY_MIN_INTERVAL - (now - stamps[-1])
             else:
                 self._sent_at[chat] = stamps
                 return
-            log.info(
-                "目标群 %s 已达发送上限（%s/%s 条），等 %.1f 秒",
-                chat, len(stamps), COPY_RATE_LIMIT, wait,
-            )
-            await asyncio.sleep(min(max(wait, 0.2), 65.0))
+            log.info("群 %s 发送排队 used=%s cost=%s wait=%.1f", chat, len(stamps), count, wait)
+            await asyncio.sleep(max(wait, 0.2))
 
-    def _record_sent(self, to_chat: int) -> None:
-        """记一次成功发送（失败的不算，不能把额度白白吃掉）。"""
-        chat = int(to_chat)
+    def _record_sent(self, to_chat: int, count: int = 1) -> None:
         now = time.time()
+        chat = int(to_chat)
         stamps = [t for t in self._sent_at.get(chat, []) if now - t < COPY_RATE_WINDOW]
-        stamps.append(now)
-        self._sent_at[chat] = stamps
+        self._sent_at[chat] = stamps + [now] * max(1, int(count))
 
     def copy_rate_status(self) -> dict:
-        """给诊断用：每个目标群最近 60 秒已经发了多少条。"""
         now = time.time()
-        return {
-            "limit": COPY_RATE_LIMIT,
-            "window_seconds": int(COPY_RATE_WINDOW),
-            "chats": {
-                str(chat): len([t for t in stamps if now - t < COPY_RATE_WINDOW])
-                for chat, stamps in self._sent_at.items()
-            },
-        }
+        return {"limit": COPY_RATE_LIMIT, "window_seconds": int(COPY_RATE_WINDOW),
+                "chats": {str(chat): len([t for t in stamps if now - t < COPY_RATE_WINDOW])
+                          for chat, stamps in self._sent_at.items()}}
 
     async def _send_source_note(self, result, to_chat: int, note: str,
                                 conf: dict, client: httpx.AsyncClient) -> None:
@@ -1594,38 +1626,28 @@ class TelegramBotRunner:
             )
 
     async def _flush_pending_albums(self, conf: dict) -> int:
-        """停止前把还没发出去的相册发掉。
-
-        相册要等 2 秒凑齐，正好在这 2 秒里重启，内存里的待发列表就没了。
-        重启不常有，但那是真实存在的一个「漏一条」窗口，收一下。
-        （不能用 asyncio.run：这里已经在事件循环里了）
-        """
-        pending, self._album_pending = self._album_pending, {}
-        for task in self._album_tasks.values():
-            task.cancel()
-        self._album_tasks.clear()
-        self._album_origins.clear()
-        if not pending:
-            return 0
-        target = forwarder.load_relay_target(self.store)
-        to_chat = int(target.get("chat_id") or 0)
-        token = str(conf.get("token") or "")
-        if not to_chat or not token:
+        # Drain the same worker and ledger, keeping the original sender/destination.
+        self._relay_stopping = True
+        if not self._album_pending and not self._album_tasks:
             return 0
         sent = 0
-        for ids in pending.values():
-            try:
-                await bot_api.copy_messages(
-                    token, to_chat, int(conf["user_id"]), ids,
-                )
-            except Exception as e:
-                log.warning("Bot 停止前补发相册失败：%s", str(e)[:200])
-                forwarder.note_relay_result(self.store, ok=False, error=str(e)[:200])
+        active = []
+        for group, task in list(self._album_tasks.items()):
+            if group in self._album_sending:
+                active.append(task)
             else:
-                sent += len(ids)
-                forwarder.note_relay_result(self.store, ok=True, count=len(ids))
-        if sent:
-            log.info("Bot 停止前补发了 %s 条相册消息", sent)
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
+        for group in list(self._album_pending):
+            context = self._album_context.get(group)
+            if not context:
+                continue
+            sent += len(self._album_pending.get(group, {}))
+            await self._flush_album(group, context["from_chat"], context["to_chat"],
+                context["conf"], None, context.get("note", ""))
         return sent
 
     async def _handle_callback(self, callback: dict, conf: dict,

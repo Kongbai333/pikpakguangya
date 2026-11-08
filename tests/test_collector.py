@@ -64,7 +64,7 @@ class FakeClient:
         self.forwards.append({
             "entity": entity, "ids": list(messages or []), "from_peer": from_peer,
         })
-        return []
+        return [SimpleNamespace(id=1000 + mid) for mid in (messages or [])]
 
 
 class FakeTg:
@@ -165,7 +165,7 @@ def test_concurrent_album_triggers_only_one_forward(tmp_path):
 
         async def get_messages(self, *a, **kw):
             await asyncio.sleep(0)
-            return await super().get_messages(*a, **kw)
+            return msgs
 
         async def forward_messages(self, entity=None, messages=None,
                                    from_peer=None, **kwargs):
@@ -201,7 +201,8 @@ def test_failed_forward_can_be_retried(tmp_path):
     msg = SimpleNamespace(id=321, grouped_id=None, video=object(), caption=None)
 
     async def boom(*a, **kw):
-        raise RuntimeError("network down")
+        from telethon.errors import ChatWriteForbiddenError
+        raise ChatWriteForbiddenError(None)
 
     client.forward_messages = boom
     asyncio.run(c._forward_media(client, chat, msg, set()))
@@ -213,7 +214,7 @@ def test_failed_forward_can_be_retried(tmp_path):
 
     async def ok(entity=None, messages=None, from_peer=None, **kw):
         client.forwards.append({"entity": entity, "ids": list(messages or [])})
-        return []
+        return [SimpleNamespace(id=1000 + mid) for mid in (messages or [])]
 
     client.forward_messages = ok
     asyncio.run(c._forward_media(client, chat, msg, set()))

@@ -347,6 +347,15 @@ def build_router(ctx: WebContext) -> APIRouter:
                 if status.get("running")
                 else f"没在跑：{status.get('error') or '检查 Bot Token / 是否被 Webhook 占用'}",
             )
+            error_text = str(status.get("error") or "")
+            if "409" in error_text or "conflict" in error_text.lower():
+                # 两个进程抢同一个 Token 会互相抢 update，表现出来的就是“同一条重复发”
+                add(
+                    "只跑了一个 bot 实例",
+                    False,
+                    "Telegram 报 409 Conflict：还有另一个进程/容器在用同一个 "
+                    "Bot Token 收消息。两边抢 update 就会重复投递，先把多余的停掉",
+                )
             if status.get("last_update_at"):
                 add("bot 最近收到消息", True, str(status["last_update_at"]))
 
@@ -371,6 +380,17 @@ def build_router(ctx: WebContext) -> APIRouter:
             bool(watching),
             "、".join(w["title"] or str(w["chat_id"]) for w in watching)
             or "一个都没打开",
+        )
+
+        if mode == "bot":
+            scope = f"bot-in:{token.split(':', 1)[0]}:{int(relay.get('chat_id') or 0)}"
+        else:
+            scope = forwarder.delivery_scope(target)
+        counts = store.forward_delivery_counts(scope)
+        add(
+            "转发去重账本", not counts.get("uncertain"),
+            f"已确认 {counts.get('sent', 0)} 条记录，发送中 {counts.get('sending', 0)} 条，"
+            f"待核对 {counts.get('uncertain', 0)} 条；待核对记录不会自动重发",
         )
 
         return {

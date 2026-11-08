@@ -81,6 +81,7 @@ class Collector:
         self._log_lines: deque[str] = deque(maxlen=60)
         # 正在转发中的消息/相册（同步预约，防并发重复转发）
         self._inflight: set[str] = set()
+        self._forward_locks: dict[int, asyncio.Lock] = {}
 
     # ---------- 日志 / 状态 ----------
     def _note(self, msg: str) -> None:
@@ -274,11 +275,9 @@ class Collector:
 
         实时链路和补偿回溯都走这里。
 
-        并发去重很重要：Telethon 的 handler 是**并发**派发的，一个相册里的
-        3 条消息会同时进来，而它们各自都会去转「整个相册」—— 如果只用
-        “转过之后再记录”的方式去重，3 个协程会全在记录之前通过检查，
-        结果同一个视频在目标群出现 3 次。所以这里先「预约」再转发：
-        预约是同步的（中间不 await），后到的直接让路。
+        同一源群先串行排队，再用 SQLite 原子占用每条源消息。
+        相册晚到的成员不能直接丢弃；排队后重新查库，只发送尚未发送的成员。
+        进程内集合只拦同一消息的重复触发，跨账号/重启依靠数据库记录。
         """
         chat_id = int(getattr(chat, "id", 0) or 0)
         if not chat_id or msg is None:
@@ -302,8 +301,9 @@ class Collector:
         grouped = getattr(msg, "grouped_id", None)
         # 预约键：这条消息本身 + （相册）整组
         keys = {f"msg:{chat_id}:{mid}"}
-        if grouped:
-            keys.add(f"album:{chat_id}:{grouped}")
+        # Queue album siblings instead of dropping them: later arrivals may be
+        # absent from the first get_messages response. SQLite dedupes each member.
+        album_lock = self._forward_locks.setdefault(chat_id, asyncio.Lock())
         if keys & self._inflight:
             log.info(
                 "同一条消息正在转发中，跳过重复触发 chat=%s msg=%s album=%s",
@@ -313,16 +313,16 @@ class Collector:
 
         # 再查落库的记录：重启后内存集合会空，补偿回溯会把最近 60 分钟
         # 的视频重扫一遍，不查这里就会整批重复转发。
-        if forwarder.was_forwarded(self.store, self.account_id, chat_id, mid):
-            log.info("跳过已转发过的视频 chat=%s msg=%s", chat_id, mid)
-            return
+        # Historical JSON entries are imported once into a destination-scoped ledger.
+        forwarder.seed_collector_history(self.store, self.account_id, target)
 
         # 同步预约，后面才 await —— 并发的兄弟协程到这里就会直接让路
         self._inflight |= keys
         try:
-            await self._forward_locked(
-                client, chat, msg, target, forwarded_albums, chat_id, mid,
-            )
+            async with album_lock:
+                await self._forward_locked(
+                    client, chat, msg, target, forwarded_albums, chat_id, mid,
+                )
         finally:
             self._inflight -= keys
 
@@ -330,25 +330,54 @@ class Collector:
                               forwarded_albums: set[int], chat_id: int,
                               mid: int) -> None:
         """预约到之后的真正转发（细节和统计）。"""
-        # 先记「看到了一条视频」，和 forwarded/failed 对账用
+        # Claim each album member in SQLite before any send. Different accounts
+        # watching the same source and destination share these reservations.
+        source_chat = forwarder.source_chat_id(chat)
+        scope = forwarder.delivery_scope(target)
+        ids = await forwarder.album_ids(client, chat, msg)
+        claims = {}
+        for source_id in ids:
+            owner = self.store.claim_forward_delivery(scope, [f"src:{source_chat}:{source_id}"])
+            if owner:
+                claims[source_id] = owner
+        if not claims:
+            log.info("跳过已有转发记录/正在发送：scope=%s source=%s ids=%s", scope, source_chat, ids)
+            return
         forwarder.note_seen(self.store, self.account_id)
 
         try:
             if str(target.get("mode") or "direct") == "bot":
                 # 经 bot 中转：采集号只负责把视频丢给 bot 私聊
                 result = await forwarder.forward_to_bot(
-                    client, chat, msg, target, forwarded_albums=forwarded_albums,
+                    client, chat, msg, target, source_ids=list(claims),
                 )
             else:
                 result = await forwarder.forward_message(
-                    client, chat, msg, target, forwarded_albums=forwarded_albums,
+                    client, chat, msg, target, source_ids=list(claims),
                 )
-        except Exception as e:      # 兜底：别把事件循环带崩
-            result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-        if result.get("skipped") == "album":
-            return                  # 相册里已经整组转过了
+        except asyncio.CancelledError:
+            for owner in claims.values():
+                self.store.finish_forward_delivery(scope, owner, "uncertain", error="发送期间停止，待人工核对")
+            raise
+        except Exception as e:
+            result = {"ok": False, "error": f"{type(e).__name__}: {e}", "uncertain": True}
 
+        state = "sent" if result.get("ok") else ("uncertain" if result.get("uncertain") else "failed")
+        for owner in claims.values():
+            self.store.finish_forward_delivery(
+                scope, owner, state, result_ids=result.get("relay_ids") or [],
+                error=str(result.get("error") or ""),
+            )
         if result.get("ok"):
+            if target.get("mode") == "bot":
+                account = self.store.get_account(self.account_id) or self.account
+                self.store.record_forward_relay_sources(
+                    str(target.get("bot_user_id") or ""), int(account.get("user_id") or 0),
+                    source_chat, list(claims), result.get("relay_ids") or [],
+                    forwarder.bot_chat_id(target),
+                    source_title=L._chat_title(chat),
+                    source_username=str(getattr(chat, "username", "") or ""),
+                )
             forwarder.mark_forwarded(
                 self.store, self.account_id, chat_id,
                 result.get("ids") or [getattr(msg, "id", 0)],

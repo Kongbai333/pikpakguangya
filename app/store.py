@@ -10,6 +10,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 
 # datetime 的 time 起别名：直接叫 time 会遮蔽上面那个 time 模块，
@@ -21,6 +22,28 @@ from typing import Any, Iterator
 from app import timeutil
 
 SCHEMA = """
+-- Per-destination message ledger. Reservations are atomic across Store instances.
+CREATE TABLE IF NOT EXISTS forward_deliveries (
+  scope TEXT NOT NULL,
+  source_key TEXT NOT NULL,
+  status TEXT NOT NULL,
+  owner TEXT NOT NULL,
+  result_ids TEXT NOT NULL DEFAULT '[]',
+  error TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (scope, source_key)
+);
+CREATE TABLE IF NOT EXISTS forward_relay_sources (
+  bot_id TEXT NOT NULL,
+  sender_id INTEGER NOT NULL,
+  message_id INTEGER NOT NULL,
+  source_chat INTEGER NOT NULL,
+  source_message INTEGER NOT NULL,
+  target_chat INTEGER NOT NULL,
+  source_title TEXT NOT NULL DEFAULT '',
+  source_username TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (bot_id, sender_id, message_id)
+);
 CREATE TABLE IF NOT EXISTS messages (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   chat_id      INTEGER NOT NULL,
@@ -288,6 +311,86 @@ class Store:
         # 每次失效都 +1。用来判断「算这份结果的过程中有没有人写过」——
         # 有的话这份结果可能已经过期，不能存进缓存。
         self._cache_gen = 0
+
+    # ---------- 转发逐条记账（不随最近 3000 条 JSON 缓存淘汰） ----------
+    def claim_forward_delivery(self, scope: str, keys: list[str]) -> str:
+        keys = sorted({str(key) for key in keys if key})
+        if not keys:
+            return ""
+        owner = uuid.uuid4().hex
+        with self._write(invalidate=()) as c:
+            c.execute("BEGIN IMMEDIATE")
+            for key in keys:
+                row = c.execute(
+                    "SELECT status FROM forward_deliveries WHERE scope=? AND source_key=?",
+                    (scope, key),
+                ).fetchone()
+                if row and row["status"] != "failed":
+                    return ""
+            for key in keys:
+                c.execute(
+                    "INSERT INTO forward_deliveries (scope,source_key,status,owner,updated_at)"
+                    " VALUES (?,?,'sending',?,?) ON CONFLICT(scope,source_key) DO UPDATE SET"
+                    " status='sending',owner=excluded.owner,error='',updated_at=excluded.updated_at",
+                    (scope, key, owner, iso(utcnow())),
+                )
+        return owner
+
+    def finish_forward_delivery(self, scope: str, owner: str, status: str, *,
+                                result_ids: list[int] | None = None, error: str = "") -> None:
+        if status not in ("sent", "failed", "uncertain"):
+            raise ValueError("Invalid forwarding result status")
+        with self._write(invalidate=()) as c:
+            c.execute(
+                "UPDATE forward_deliveries SET status=?,result_ids=?,error=?,updated_at=?"
+                " WHERE scope=? AND owner=? AND status='sending'",
+                (status, json.dumps(result_ids or []), error[:300], iso(utcnow()), scope, owner),
+            )
+
+    def forward_delivery_counts(self, scope: str) -> dict[str, int]:
+        with self._read() as c:
+            rows = c.execute(
+                "SELECT status,COUNT(*) AS n FROM forward_deliveries WHERE scope=? GROUP BY status",
+                (scope,),
+            ).fetchall()
+        return {row["status"]: int(row["n"]) for row in rows}
+
+    def seed_forward_history(self, scope: str, legacy_key: str, keys: list[str]) -> None:
+        marker = f"migration.forward-ledger:{legacy_key}"
+        with self._write(invalidate=()) as c:
+            c.execute("BEGIN IMMEDIATE")
+            if c.execute("SELECT 1 FROM state WHERE key=?", (marker,)).fetchone():
+                return
+            c.executemany(
+                "INSERT OR IGNORE INTO forward_deliveries"
+                " (scope,source_key,status,owner,updated_at) VALUES (?,?,'sent','legacy',?)",
+                [(scope, key, iso(utcnow())) for key in set(keys) if key],
+            )
+            c.execute("INSERT INTO state(key,value) VALUES (?,'1')", (marker,))
+
+    def record_forward_relay_sources(self, bot_id: str, sender_id: int,
+                                    source_chat: int, source_ids: list[int],
+                                    relay_ids: list[int], target_chat: int, *,
+                                    source_title: str = "", source_username: str = "") -> None:
+        if not bot_id or not sender_id or len(source_ids) != len(relay_ids):
+            return
+        with self._write(invalidate=()) as c:
+            c.executemany(
+                "INSERT OR IGNORE INTO forward_relay_sources"
+                " (bot_id,sender_id,message_id,source_chat,source_message,target_chat,source_title,source_username)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                [(str(bot_id), int(sender_id), int(dm), int(source_chat), int(src), int(target_chat), source_title, source_username)
+                 for src, dm in zip(source_ids, relay_ids) if int(dm) > 0],
+            )
+
+    def get_forward_relay_source(self, bot_id: str, sender_id: int, message_id: int) -> dict:
+        with self._read() as c:
+            row = c.execute(
+                "SELECT source_chat,source_message,target_chat,source_title,source_username FROM forward_relay_sources"
+                " WHERE bot_id=? AND sender_id=? AND message_id=?",
+                (str(bot_id), int(sender_id), int(message_id)),
+            ).fetchone()
+        return dict(row) if row else {}
 
     # ---------- 聚合缓存 ----------
     def _cached(self, key: str, loader):

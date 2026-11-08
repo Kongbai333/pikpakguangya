@@ -603,7 +603,7 @@ class FakeBotForwardClient:
         if self.error is not None:
             raise self.error
         self.forwards.append({"to": entity, "ids": list(messages or [])})
-        return []
+        return [FakeSent(1000 + mid) for mid in (messages or [])]
 
 
 def test_forward_to_bot_targets_the_bot_not_the_group():
@@ -704,7 +704,8 @@ def test_bot_relay_copies_single_video(store):
 
     async def fake_api_post(client, conf, method, payload):
         sent.append((method, payload))
-        return {}
+        return ([{"message_id": 1000 + mid} for mid in payload["message_ids"]]
+                if method == "copyMessages" else {"message_id": 1000})
 
     bot._api_post = fake_api_post
     conf = {"token": "1:abc", "user_id": 42}
@@ -890,7 +891,8 @@ def test_bot_relay_batches_album(store, monkeypatch):
 
     async def fake_api_post(client, conf, method, payload):
         sent.append((method, payload))
-        return {}
+        return ([{"message_id": 1000 + mid} for mid in payload["message_ids"]]
+                if method == "copyMessages" else {"message_id": 1000})
 
     bot._api_post = fake_api_post
     conf = {"token": "1:abc", "user_id": 42}
@@ -1064,7 +1066,8 @@ def test_bot_relays_video_from_collector_account(store):
 
     async def fake_api_post(client, conf, method, payload):
         sent.append((method, payload))
-        return {}
+        return ([{"message_id": 1000 + mid} for mid in payload["message_ids"]]
+                if method == "copyMessages" else {"message_id": 1000})
 
     bot._api_post = fake_api_post
     conf = {"token": "1:abc", "user_id": ADMIN_UID}
