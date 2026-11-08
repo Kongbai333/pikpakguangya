@@ -79,6 +79,8 @@ class Collector:
         # 这个账号最近的事件；内置采集的日志在 Web 控制台，管理页看不到，
         # 所以留一份在内存里给页面显示（重启就没了，无所谓）。
         self._log_lines: deque[str] = deque(maxlen=60)
+        # 正在转发中的消息/相册（同步预约，防并发重复转发）
+        self._inflight: set[str] = set()
 
     # ---------- 日志 / 状态 ----------
     def _note(self, msg: str) -> None:
@@ -270,10 +272,13 @@ class Collector:
     async def _forward_media(self, client, chat, msg, forwarded_albums: set[int]) -> None:
         """把一条（可能是相册的）视频转发出去。
 
-        实时链路和补偿回溯都走这里：实时链路保不准会漏（handler 抛异常、
-        Telegram 少推一条 update、连接抖一下），回溯时把最近的补转一次，
-        避免出现「预览里有、目标群里没有」。
-        转发失败不影响采集本身 —— 拿不到的东西记下来，别把整条链路拖垮。
+        实时链路和补偿回溯都走这里。
+
+        并发去重很重要：Telethon 的 handler 是**并发**派发的，一个相册里的
+        3 条消息会同时进来，而它们各自都会去转「整个相册」—— 如果只用
+        “转过之后再记录”的方式去重，3 个协程会全在记录之前通过检查，
+        结果同一个视频在目标群出现 3 次。所以这里先「预约」再转发：
+        预约是同步的（中间不 await），后到的直接让路。
         """
         chat_id = int(getattr(chat, "id", 0) or 0)
         if not chat_id or msg is None:
@@ -293,13 +298,38 @@ class Collector:
                 )
             return
 
-        # 先查落库的去重记录：重启后内存集合会空，补偿回溯会把最近 60 分钟
-        # 的视频重扫一遍，不查这里就会整批重复转发。
         mid = int(getattr(msg, "id", 0) or 0)
+        grouped = getattr(msg, "grouped_id", None)
+        # 预约键：这条消息本身 + （相册）整组
+        keys = {f"msg:{chat_id}:{mid}"}
+        if grouped:
+            keys.add(f"album:{chat_id}:{grouped}")
+        if keys & self._inflight:
+            log.info(
+                "同一条消息正在转发中，跳过重复触发 chat=%s msg=%s album=%s",
+                chat_id, mid, grouped or "-",
+            )
+            return
+
+        # 再查落库的记录：重启后内存集合会空，补偿回溯会把最近 60 分钟
+        # 的视频重扫一遍，不查这里就会整批重复转发。
         if forwarder.was_forwarded(self.store, self.account_id, chat_id, mid):
             log.info("跳过已转发过的视频 chat=%s msg=%s", chat_id, mid)
             return
 
+        # 同步预约，后面才 await —— 并发的兄弟协程到这里就会直接让路
+        self._inflight |= keys
+        try:
+            await self._forward_locked(
+                client, chat, msg, target, forwarded_albums, chat_id, mid,
+            )
+        finally:
+            self._inflight -= keys
+
+    async def _forward_locked(self, client, chat, msg, target: dict,
+                              forwarded_albums: set[int], chat_id: int,
+                              mid: int) -> None:
+        """预约到之后的真正转发（细节和统计）。"""
         # 先记「看到了一条视频」，和 forwarded/failed 对账用
         forwarder.note_seen(self.store, self.account_id)
 

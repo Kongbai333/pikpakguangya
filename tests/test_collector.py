@@ -139,6 +139,88 @@ def test_same_video_is_not_forwarded_twice(tmp_path):
     assert forwarder.load_stats(store, c.account_id)["seen"] == 1
 
 
+def test_concurrent_album_triggers_only_one_forward(tmp_path):
+    """相册里的 3 条消息会**并发**进来，每条都去转整组 —— 只能成功一次。
+
+    Telethon 的 handler 并发派发，以前 3 个协程都会在“记录已转”之前通过检查，
+    结果同一个视频在目标群出现 3 次。
+    """
+    from app import forwarder
+
+    c, store, _, client = make(tmp_path)
+    store.set_forward_watched(CHAT_ID, True, account_id=c.account_id)
+    forwarder.save_target(
+        store, c.account_id, chat_id=-100777, raw_id=0, access_hash=0,
+        title="目标群", kind="channel", mode="bot",
+        bot_username="my_bot", bot_user_id=1,
+    )
+    chat = SimpleNamespace(id=CHAT_ID, title="测试群")
+    msgs = [
+        SimpleNamespace(id=100 + i, grouped_id=777, video=object(), caption=None)
+        for i in range(3)
+    ]
+
+    class SlowClient(type(client)):
+        """真实网络会 await，这里必须让出控制权才能复现并发。"""
+
+        async def get_messages(self, *a, **kw):
+            await asyncio.sleep(0)
+            return await super().get_messages(*a, **kw)
+
+        async def forward_messages(self, entity=None, messages=None,
+                                   from_peer=None, **kwargs):
+            await asyncio.sleep(0)
+            return await super().forward_messages(
+                entity=entity, messages=messages, from_peer=from_peer, **kwargs
+            )
+
+    slow = SlowClient()
+
+    async def main():
+        await asyncio.gather(*[
+            c._forward_media(slow, chat, m, set()) for m in msgs
+        ])
+
+    asyncio.run(main())
+    assert len(slow.forwards) == 1        # 只转了一次整组
+    assert forwarder.load_stats(store, c.account_id)["seen"] == 1
+
+
+def test_failed_forward_can_be_retried(tmp_path):
+    """转发失败要释放预约：否则失败一次就永远不再重试。"""
+    from app import forwarder
+
+    c, store, _, client = make(tmp_path)
+    store.set_forward_watched(CHAT_ID, True, account_id=c.account_id)
+    forwarder.save_target(
+        store, c.account_id, chat_id=-100777, raw_id=0, access_hash=0,
+        title="目标群", kind="channel", mode="bot",
+        bot_username="my_bot", bot_user_id=1,
+    )
+    chat = SimpleNamespace(id=CHAT_ID, title="测试群")
+    msg = SimpleNamespace(id=321, grouped_id=None, video=object(), caption=None)
+
+    async def boom(*a, **kw):
+        raise RuntimeError("network down")
+
+    client.forward_messages = boom
+    asyncio.run(c._forward_media(client, chat, msg, set()))
+    assert forwarder.load_stats(store, c.account_id)["failed"] == 1
+    assert c._inflight == set()             # 预约已释放
+
+    # 恢复后重试一次应当能成功（没被误记成“已转过”）
+    client.forwards.clear()
+
+    async def ok(entity=None, messages=None, from_peer=None, **kw):
+        client.forwards.append({"entity": entity, "ids": list(messages or [])})
+        return []
+
+    client.forward_messages = ok
+    asyncio.run(c._forward_media(client, chat, msg, set()))
+    assert len(client.forwards) == 1
+    assert forwarder.was_forwarded(store, c.account_id, CHAT_ID, 321) is True
+
+
 def test_start_blocked_by_preflight(tmp_path):
     c, _, _, _ = make(tmp_path, credentials=False, with_proxy=False, watched=False)
 

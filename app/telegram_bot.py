@@ -1337,9 +1337,11 @@ class TelegramBotRunner:
         group = str(message.get("media_group_id") or "")
         note = self._source_note(message)
         origin = self._origin_key(message)
-        if origin and self._already_copied(origin):
-            # 采集侧重发了同一条（重启后的补偿回溯、或手动又转了一次）
-            log.info("跳过重复视频：来源 %s 已经投递过", origin)
+        # 兜底键：私聊里的消息 id。普通群的转发拿不到 forward_from_chat，
+        # 这时只能靠它去重（bot 重复投递、或采集侧重发都会命中）。
+        dedupe_keys = [k for k in (origin, f"dm:{from_chat}:{msg_id}") if k]
+        if any(self._already_copied(k) for k in dedupe_keys):
+            log.info("跳过重复视频：%s 已经投递过", origin or f"dm:{from_chat}:{msg_id}")
             return True
         log.info(
             "Bot 收到待转发视频 msg=%s from=%s album=%s → 群 %s",
@@ -1348,8 +1350,8 @@ class TelegramBotRunner:
         if group:
             # 相册：等同一个 media_group_id 的消息齐了再 copyMessages
             self._album_pending.setdefault(group, []).append(msg_id)
-            if origin:
-                self._album_origins.setdefault(group, []).append(origin)
+            if dedupe_keys:
+                self._album_origins.setdefault(group, []).extend(dedupe_keys)
             task = self._album_tasks.get(group)
             if task is None or task.done():
                 self._album_tasks[group] = asyncio.create_task(
@@ -1361,7 +1363,7 @@ class TelegramBotRunner:
             [msg_id], from_chat, chat_id, conf, client, note,
             # 原文没配文字时，把来源直接写进 caption，省一条消息
             caption_ok=not str(message.get("caption") or "").strip(),
-            origins=[origin] if origin else [],
+            origins=dedupe_keys,
         )
         return True
 
